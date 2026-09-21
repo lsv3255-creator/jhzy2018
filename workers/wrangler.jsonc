@@ -8,65 +8,80 @@
  *
  * local 使用 wrangler 自带的本地 D1（miniflare sqlite），不连接 Cloudflare Production。
  */
-
 {
-  "name": "jhzy-v2-worker",
-  "main": "src/index.ts",
-  "compatibility_date": "2025-08-01",
-  "compatibility_flags": ["nodejs_compat"],
-
-  // ===== 默认环境 = local（本阶段唯一可执行环境）=====
-  "d1_databases": [
-    {
-      "binding": "DB",
-      "database_name": "jhzy-v2-local",
-      "database_id": "local-placeholder-do-not-use-in-production",
-      "migrations_dir": "migrations",
-      "preview_database_id": "local-preview-placeholder"
-    }
-  ],
-
-  // P33-P3A-2：文件对象存储绑定（仅【本地配置声明】）。
-  // - binding FILES 供 src/env.ts 的 FILES: R2Bucket 使用；local 由 Miniflare 内置 R2 模拟，
-  //   持久化到 .wrangler/state（--persist-to），不连接任何远端资源。
-  // - bucket_name 采用冻结名称 jhzy20-files（docs/architecture/D1-STORAGE-DESIGN.md §2.1）。
-  // - 【本轮纪律】禁止执行 wrangler r2 bucket create / 任何 deploy；未在 Cloudflare 创建任何资源。
-  "r2_buckets": [
-    {
-      "binding": "FILES",
-      "bucket_name": "jhzy20-files"
-    }
-  ],
-
-  "vars": {
-    "ENVIRONMENT": "local",
-    "IDENTITY_HMAC_KEY_PREVIOUS": "test-previous-hmac-key-2026"
-  },
-
-  // ===== preview 环境：结构占位，禁止填真实 ID / Secrets =====
-  "env": {
-    "preview": {
-      "vars": { "ENVIRONMENT": "preview" },
-      "d1_databases": [
-        {
-          "binding": "DB",
-          "database_name": "jhzy-v2-preview",
-          "database_id": "PREVIEW_DATABASE_ID_PLACEHOLDER",
-          "migrations_dir": "migrations"
-        }
-      ]
-    },
-    // ===== production 环境：结构占位，禁止填真实 ID / Secrets =====
-    "production": {
-      "vars": { "ENVIRONMENT": "production" },
-      "d1_databases": [
-        {
-          "binding": "DB",
-          "database_name": "jhzy-v2-prod",
-          "database_id": "PRODUCTION_DATABASE_ID_PLACEHOLDER",
-          "migrations_dir": "migrations"
-        }
-      ]
-    }
-  }
+	"name": "jhzy-v2-worker",
+	"main": "src/index.ts",
+	"compatibility_date": "2025-08-01",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	// ===== 默认环境 = local（本阶段唯一可执行环境）=====
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "jhzy-v2-db",
+			"database_id": "ea603f43-d076-4df5-b118-3d8a0c245439",
+			"migrations_dir": "migrations",
+			"preview_database_id": "local-preview-placeholder"
+		}
+	],
+	// P33-P3A-2：文件对象存储绑定（仅【本地配置声明】）。
+	// - binding FILES 供 src/env.ts 的 FILES: R2Bucket 使用；local 由 Miniflare 内置 R2 模拟，
+	//   持久化到 .wrangler/state（--persist-to），不连接任何远端资源。
+	// - bucket_name 采用冻结名称 jhzy20-files（docs/architecture/D1-STORAGE-DESIGN.md §2.1）。
+	// - 【本轮纪律】禁止执行 wrangler r2 bucket create / 任何 deploy；未在 Cloudflare 创建任何资源。
+	"r2_buckets": [
+		{
+			"binding": "FILES",
+			"bucket_name": "jhzy20-files"
+		}
+	],
+	"vars": {
+		"ENVIRONMENT": "local",
+		"IDENTITY_HMAC_KEY_PREVIOUS": "test-previous-hmac-key-2026"
+	},
+	// ===== preview 环境：结构占位，禁止填真实 ID / Secrets =====
+	"env": {
+		// P9 WP4-E M1 — Staging D1 binding (created 2026-09-21, remote, WNAM). Import-only env.
+		"staging": {
+			"vars": {
+				"ENVIRONMENT": "staging"
+			},
+			"d1_databases": [
+				{
+					"binding": "DB",
+					"database_name": "jhzy-v2-staging",
+					"database_id": "85853fb1-1384-486e-9be3-566f72f45c5d",
+					"migrations_dir": "migrations"
+				}
+			]
+		},
+		"preview": {
+			"vars": {
+				"ENVIRONMENT": "preview"
+			},
+			"d1_databases": [
+				{
+					"binding": "DB",
+					"database_name": "jhzy-v2-preview",
+					"database_id": "PREVIEW_DATABASE_ID_PLACEHOLDER",
+					"migrations_dir": "migrations"
+				}
+			]
+		},
+		// ===== production 环境：WP5 已授权绑定真实资源（2026-09-21 生产导入）=====
+		"production": {
+			"vars": {
+				"ENVIRONMENT": "production"
+			},
+			"d1_databases": [
+				{
+					"binding": "DB",
+					"database_name": "jhzy-v2-prod",
+					"database_id": "d372229f-c0ae-4dcc-b968-4ec7c2832842",
+					"migrations_dir": "migrations"
+				}
+			]
+		}
+	}
 }
