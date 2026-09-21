@@ -71,8 +71,10 @@
 		},
 		// ===== production 环境：WP5 已授权绑定真实资源（2026-09-21 生产导入）=====
 		"production": {
+			"workers_dev": true,
 			"vars": {
-				"ENVIRONMENT": "production"
+				"ENVIRONMENT": "production",
+				"IDENTITY_HMAC_KEY_PREVIOUS": "test-previous-hmac-key-2026"
 			},
 			"d1_databases": [
 				{
@@ -80,6 +82,12 @@
 					"database_name": "jhzy-v2-prod",
 					"database_id": "d372229f-c0ae-4dcc-b968-4ec7c2832842",
 					"migrations_dir": "migrations"
+				}
+			],
+			"r2_buckets": [
+				{
+					"binding": "FILES",
+					"bucket_name": "jhzy20-files"
 				}
 			]
 		}
