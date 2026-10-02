@@ -37,8 +37,7 @@
 		}
 	],
 	"vars": {
-		"ENVIRONMENT": "local",
-		"IDENTITY_HMAC_KEY_PREVIOUS": "test-previous-hmac-key-2026"
+		"ENVIRONMENT": "local"
 	},
 	// ===== preview 环境：结构占位，禁止填真实 ID / Secrets =====
 	"env": {
@@ -74,7 +73,8 @@
 			"workers_dev": true,
 			"vars": {
 				"ENVIRONMENT": "production",
-				"IDENTITY_HMAC_KEY_PREVIOUS": "test-previous-hmac-key-2026"
+				"WECHAT_APPID": "wxfd0c72ef78144686",
+				"ADMIN_ALLOWED_ORIGINS": "https://admin.jhzyfw.com"
 			},
 			"d1_databases": [
 				{
