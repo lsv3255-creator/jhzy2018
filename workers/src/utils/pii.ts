@@ -75,6 +75,26 @@ export class PiiCrypto {
     return new TextDecoder().decode(pt);
   }
 
+  /** 通用 PII 加密（与真实姓名/手机号同密钥派生，同一 envelope `iv:ct` base64url）。
+   *  用于 volunteer_profiles 中无法归入姓名/手机字段的复合 PII（如 emergency_contact JSON）。
+   *  解密仅需同一 IDENTITY_HMAC_KEY，与运行时完全一致。 */
+  async encryptGeneric(plain: string): Promise<string> {
+    const key = await this.aesKey;
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(plain));
+    return `${b64url(iv)}:${b64url(new Uint8Array(ct))}`;
+  }
+
+  /** 通用 PII 解密（仅可信 backend 路径；结果明文不返回客户端/不进日志）。 */
+  async decryptGeneric(cipher: string): Promise<string> {
+    const key = await this.aesKey;
+    const [ivB64, ctB64] = cipher.split(':');
+    const iv = fromB64url(ivB64);
+    const ct = fromB64url(ctB64);
+    const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct);
+    return new TextDecoder().decode(pt);
+  }
+
   /** 身份证脱敏：保留末 4 位，其余掩码。 */
   maskIdCard(idCard: string): string {
     if (idCard.length <= 4) return idCard;
@@ -97,6 +117,16 @@ export class PiiCrypto {
       new TextEncoder().encode(plain),
     );
     return `${b64url(iv)}:${b64url(new Uint8Array(ct))}`;
+  }
+
+  /** 手机号解密（仅可信 backend 路径；结果明文不返回客户端 / 不进日志）。 */
+  async decryptPhone(cipher: string): Promise<string> {
+    const key = await this.aesKey;
+    const [ivB64, ctB64] = cipher.split(':');
+    const iv = fromB64url(ivB64);
+    const ct = fromB64url(ctB64);
+    const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct);
+    return new TextDecoder().decode(pt);
   }
 
   /** 手机号 HMAC 指纹（与身份证同密钥体系，HMAC-SHA256）。用于去重 / 幂等。 */
