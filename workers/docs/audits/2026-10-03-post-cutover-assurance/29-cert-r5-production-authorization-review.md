@@ -156,13 +156,15 @@ HEAD 与预期一致，未 reset、未夹带无关文件。
 
 ## 8. 维护窗口清单（Step 10）
 
-> **MAINTENANCE_WINDOW_DEFINED = NO**
-> 本任务不虚构具体时间。以下为授权前必须由人工确认的清单模板。
+> **MAINTENANCE_WINDOW_DEFINED = YES**（CERT-R5-FINAL-PREFLIGHT，2026-10-03 人工确认）
+> **MAINTENANCE_WINDOW = 2026-10-04 02:00–04:00 CST**
+>
+> 本文件原不虚构具体时间；现由管理员人工确认录入。
 
 | # | 项 | 人工确认 |
 | --- | --- | --- |
-| 1 | 精确开始时间（CST） | ☐ |
-| 2 | 预计时长 | ☐ |
+| 1 | 精确开始时间（CST） | ☑ 2026-10-04 02:00–04:00 CST |
+| 2 | 预计时长 | ☑ 120 分钟（硬截止 04:00，不续做） |
 | 3 | 负责操作员 | ☐ |
 | 4 | 沟通负责人 | ☐ |
 | 5 | 写入前证书签发已关闭 | ☐ |
@@ -342,11 +344,14 @@ R5 执行前管理员必须原样提供以下显式短语（或实质等同的�
 
 已知限制：本执行环境可能无法触达 `*.workers.dev`。
 
-> **HTTP_E2E_ENVIRONMENT_AVAILABLE = UNKNOWN**
-> R5 部署后 HTTP E2E 须在可触达生产端点的环境执行。
-> 本地同源 runtime 测试为支持证据，非部署后生产 E2E 证明。
-
-因该环境状态未知 → `READY_FOR_CERT_R5_PRODUCTION_EXECUTION = NO`。
+> **HTTP_E2E_ENVIRONMENT_AVAILABLE = YES**（CERT-R5-FINAL-PREFLIGHT，2026-10-03 人工确认）
+> **HTTP_E2E_ENVIRONMENT = 用户 Mac 本机浏览器和终端 curl**
+>
+> R5 部署后 HTTP E2E 在用户 Mac 本机执行（浏览器 + 终端 `curl`）。
+> 本地同源 runtime 测试仍仅为支持证据，非部署后生产 E2E 证明。
+> P13 前置：先 `curl <PROD_BASE_URL>/health` 确认可达；不可达则回退 UNKNOWN 并 `ABORT(P13)`。
+>
+> 本执行环境自身是否可达 `*.workers.dev` 仍未知，但因 E2E 由用户在 Mac 本机执行，不再构成 R5 阻塞。
 
 ---
 
@@ -369,19 +374,20 @@ R5 执行前管理员必须原样提供以下显式短语（或实质等同的�
 | legacy 源有效 | ✅ |
 | runner 安全已验证 | ✅ |
 | 回归绿 | ✅ |
-| 维护窗口已定义 | ❌（NO，待人工） |
+| 维护窗口已定义 | ✅（2026-10-04 02:00–04:00 CST，FINAL-PREFLIGHT 人工确认） |
 | 签发关闭计划已定义 | ✅（模板，待 R5 执行） |
-| HTTP E2E 环境可用 | ❓（UNKNOWN） |
+| HTTP E2E 环境可用 | ✅（用户 Mac 本机 浏览器 + curl，FINAL-PREFLIGHT 人工确认） |
 | 授权短语已定义 | ✅ |
-| 授权短语已收到 | ❌（NO） |
-| runbook 已更新 | ✅（§18） |
+| 授权短语已收到 | ❌（NO —— 唯一硬阻塞） |
+| runbook 已更新 | ✅（§10 / §10.2） |
 | 文档已提交 | ✅（本文件 + runbook，未 push） |
-| 生产未变 | ✅ |
+| 生产未变 | ✅（migrations 44 / 0045 0 / 0046 0 / certificates 413 / id_pools 500 / worker `e7fcf4a8`） |
 
-**CERT_R5_AUTH_STATUS = PASS_WITH_FINDINGS**
+**CERT_R5_AUTH_STATUS = PASS_WITH_FINDINGS**（FINAL-PREFLIGHT 后仍为 PASS_WITH_FINDINGS）
 
-> 所有技术闸门通过；剩余为人工依赖项（维护窗口时间、HTTP E2E 环境、显式授权短语）。
-> 因此 `READY_FOR_CERT_R5_PRODUCTION_EXECUTION = NO`，`PRODUCTION_EXECUTION_AUTHORIZED = NO`。
+> 所有技术闸门通过；维护窗口与 HTTP E2E 环境已由人工确认；**剩余唯一硬阻塞为显式授权短语**（§13 授权短语未收到），
+> 另 §8 第 5/6/8/9/10 项运营确认须在 P0 前补齐。
+> 因此 `READY_FOR_CERT_R5_PRODUCTION_EXECUTION = WAITING_FOR_EXPLICIT_AUTHORIZATION`，`PRODUCTION_EXECUTION_AUTHORIZED = NO`。
 
 ---
 
@@ -396,4 +402,18 @@ R5 执行前管理员必须原样提供以下显式短语（或实质等同的�
 - 未 push Git
 - 未触达 JHZY 1.0 live
 
-**NEXT_ACTION = STOP. Await explicit human authorization.**
+### CERT-R5-FINAL-PREFLIGHT 补充（2026-10-03）
+
+```
+MAINTENANCE_WINDOW_DEFINED = YES
+MAINTENANCE_WINDOW = 2026-10-04 02:00–04:00 CST
+HTTP_E2E_ENVIRONMENT_AVAILABLE = YES
+HTTP_E2E_ENVIRONMENT = 用户 Mac 本机浏览器和终端 curl
+AUTHORIZATION_PHRASE_RECEIVED = NO
+PRODUCTION_EXECUTION_AUTHORIZED = NO
+```
+
+最终只读复核（双锁 `--profile jhzy` + `CLOUDFLARE_ACCOUNT_ID`）实测：migrations 44 / 0045 0 / 0046 0 / certificates 413 / id_pools 500 /
+production Worker active version `e7fcf4a8-f776-44cf-b857-f751924ae2f2` —— 与基线一致，生产未漂移。
+
+**NEXT_ACTION = STOP. Await explicit human authorization phrase.**

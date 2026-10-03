@@ -20,7 +20,22 @@
 | 当前 id_pools | 500 行（cert_trn CTRN%, status=0） |
 | 目标 id_pools | 450,500 行（450,000 legacy + 500 synthetic） |
 | 当前 certificates | 413 行 |
-| 维护窗口 | 待分配（建议 02:00-04:00 CST） |
+| 维护窗口 | **2026-10-04 02:00–04:00 CST**（已确认，原"待分配"） |
+| HTTP E2E 环境 | **用户 Mac 本机浏览器和终端 curl**（已确认） |
+| 授权状态 | `AUTHORIZATION_PHRASE_RECEIVED = NO` / `PRODUCTION_EXECUTION_AUTHORIZED = NO` |
+
+### 0.1 人工条件录入（CERT-R5-FINAL-PREFLIGHT，2026-10-03）
+
+```
+MAINTENANCE_WINDOW_DEFINED = YES
+MAINTENANCE_WINDOW = 2026-10-04 02:00–04:00 CST
+HTTP_E2E_ENVIRONMENT_AVAILABLE = YES
+HTTP_E2E_ENVIRONMENT = 用户 Mac 本机浏览器和终端 curl
+AUTHORIZATION_PHRASE_RECEIVED = NO
+PRODUCTION_EXECUTION_AUTHORIZED = NO
+```
+
+`READY_FOR_CERT_R5_PRODUCTION_EXECUTION = WAITING_FOR_EXPLICIT_AUTHORIZATION`。
 
 ---
 
@@ -305,24 +320,50 @@ node scripts/cert-r5-protected-legacy-pool-import-runner.mjs --mode execute \
 
 ### 10.2 授权前人工确认清单（摘要）
 
-- [ ] 维护窗口精确时间（CST）已分配
+> CERT-R5-FINAL-PREFLIGHT（2026-10-03）更新：维护窗口与 HTTP E2E 环境两项已人工确认。
+
+- [x] 维护窗口精确时间（CST）已分配 —— `2026-10-04 02:00–04:00 CST`
 - [ ] 负责操作员 / 沟通负责人已指定
 - [ ] 写入前证书签发已关闭（CLOSED_FOR_WRITES）
 - [ ] 窗口内无管理员/批量签发、无公开可用性声明
 - [ ] 回滚沟通预案已备
-- [ ] HTTP E2E 环境可达（当前 UNKNOWN → 须执行前确认）
-- [ ] 收到 §10.1 显式授权短语
+- [x] HTTP E2E 环境可达 —— 用户 Mac 本机（浏览器 + `curl`）
+- [ ] 收到 §10.1 显式授权短语 —— **唯一硬阻塞**
 
 ### 10.3 最终人工闸门
 
 未同时满足 §10.2 全部项 + §10.1 显式短语 → 不得执行本 Runbook 任何写入步骤。
 R5 命令包（P0–P15）见 `29-cert-r5-production-authorization-review.md` §10，全部为 TEMPLATE ONLY。
 
-## 11. HARD STOP
+## 11. Final Pre-Flight Read-Only Re-Verification (2026-10-03)
+
+> 双锁：`--profile jhzy` + `CLOUDFLARE_ACCOUNT_ID`。全部为只读查询。
+
+| 检查 | 预期 | 实测 | 结果 |
+| --- | --- | --- | --- |
+| d1_migrations 总数 | 44 | 44 | ✅ |
+| 0045 计数 | 0 | 0 | ✅ |
+| 0046 计数 | 0 | 0 | ✅ |
+| certificates | 413 | 413 | ✅ |
+| id_pools | 500 | 500 | ✅ |
+| production Worker active version | `e7fcf4a8-f776-44cf-b857-f751924ae2f2` | 同 | ✅ |
+
+**PRODUCTION_PRESTATE_DRIFT = NO**
+
+---
+
+## 12. HARD STOP
 
 ```
 STATUS = PLANNING ONLY
 PRODUCTION EXECUTION = NOT AUTHORIZED
 
-未获管理员显式授权，不得执行本 Runbook 任何步骤。
+MAINTENANCE_WINDOW_DEFINED = YES          (2026-10-04 02:00–04:00 CST)
+HTTP_E2E_ENVIRONMENT_AVAILABLE = YES      (用户 Mac 本机浏览器和终端 curl)
+AUTHORIZATION_PHRASE_RECEIVED = NO
+PRODUCTION_EXECUTION_AUTHORIZED = NO
+
+READY_FOR_CERT_R5_PRODUCTION_EXECUTION = WAITING_FOR_EXPLICIT_AUTHORIZATION
+
+未获管理员 §10.1 显式授权短语，不得执行本 Runbook 任何步骤。
 ```

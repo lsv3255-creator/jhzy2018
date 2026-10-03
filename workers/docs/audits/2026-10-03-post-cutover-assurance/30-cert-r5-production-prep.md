@@ -23,6 +23,32 @@
 
 ---
 
+## 0b. 人工条件录入（CERT-R5-FINAL-PREFLIGHT，2026-10-03 23:3x CST）
+
+> 由管理员人工确认后录入；本轮仍未执行 R5。
+
+```
+MAINTENANCE_WINDOW_DEFINED = YES
+MAINTENANCE_WINDOW = 2026-10-04 02:00–04:00 CST
+HTTP_E2E_ENVIRONMENT_AVAILABLE = YES
+HTTP_E2E_ENVIRONMENT = 用户 Mac 本机浏览器和终端 curl
+AUTHORIZATION_PHRASE_RECEIVED = NO
+PRODUCTION_EXECUTION_AUTHORIZED = NO
+```
+
+| 项 | 值 | 来源 |
+| --- | --- | --- |
+| 维护窗口日期 | `2026-10-04` | 人工确认 |
+| 维护窗口时段 | `02:00–04:00 CST`（120 分钟，硬截止 04:00） | 人工确认 |
+| HTTP E2E 环境 | 用户 Mac 本机浏览器 + 终端 `curl` | 人工确认 |
+| HTTP E2E 前置 | 该 Mac 须可解析并触达生产端点（workers.dev 子域或自定义域） | R5 P13 前再确认一次 |
+| 授权短语 | 未收到 | 阻塞项 |
+
+> 仍为 **NO-GO** 的唯一剩余阻塞项：§6 显式授权短语（尚未收到）。
+> 维护窗口与 HTTP E2E 环境两项已由人工确认，技术闸门与人工前置其余项见 §5。
+
+---
+
 ## 1. 建议维护窗口
 
 | 项 | 建议 |
@@ -32,8 +58,9 @@
 | 下限 | 90 分钟（若 import + 对账顺畅） |
 | 上限 | 120 分钟；超 04:00 立即触发回滚沟通预案，停止续做 |
 | 选择理由 | 生产低峰；450k import + 对账 + Worker deploy + HTTP E2E 需缓冲；与既有快照窗口习惯一致 |
-| 具体日期 | **不虚构** —— 由人工填入 `YYYY-MM-DD` |
+| 具体日期 | **2026-10-04**（CERT-R5-FINAL-PREFLIGHT 人工确认，原为待填） |
 
+> **MAINTENANCE_WINDOW = 2026-10-04 02:00–04:00 CST**（已确认）。
 > 若实际流量画像显示 02:00–04:00 非最低峰，须在授权前由人工调整并重新记录。
 
 ---
@@ -83,8 +110,18 @@
 
 ### 4.1 环境状态
 
-> **HTTP_E2E_ENVIRONMENT_AVAILABLE = UNKNOWN**
-> 本执行环境可能不可达 `*.workers.dev`；须在 R5 执行前由人工确认一个可触达生产端点的环境。
+> **HTTP_E2E_ENVIRONMENT_AVAILABLE = YES**（CERT-R5-FINAL-PREFLIGHT 人工确认）
+> **HTTP_E2E_ENVIRONMENT = 用户 Mac 本机浏览器和终端 curl**
+
+| 项 | 值 |
+| --- | --- |
+| 环境 | 用户 Mac 本机 |
+| 通道 1 | 本机浏览器（访问 `/h5/cert` 验真页） |
+| 通道 2 | 本机终端 `curl`（`/health`、`/api/v2/certificates/verify`） |
+| 前置校验 | R5 P13 前先 `curl -sS -o /dev/null -w '%{http_code}' <PROD_BASE_URL>/health`，非 2xx 视为环境不可达 |
+| 备注 | 本执行环境（非该 Mac）是否可达 `*.workers.dev` 仍未知，但不构成阻塞 —— E2E 由用户在 Mac 本机执行 |
+
+> 若 P13 时该 Mac 实际不可达生产端点 → 回退为 UNKNOWN 并 `ABORT(P13)`。
 
 ### 4.2 接口清单
 
@@ -110,12 +147,12 @@
 | 3 | legacy 源有效 | SHA `d51563b0…` MATCH | ✅ YES | GO |
 | 4 | runner 安全 | 35/0 + 18 闸门 YES | ✅ YES | GO |
 | 5 | 回归绿 | R3D/R3B/R2 + tsc + dry-run | ✅ YES | GO |
-| 6 | 维护窗口时间已分配 | 填入 `YYYY-MM-DD 02:00–04:00 CST` | ❌ 人工 | **NO-GO** |
+| 6 | 维护窗口时间已分配 | 填入 `YYYY-MM-DD 02:00–04:00 CST` | ✅ `2026-10-04 02:00–04:00 CST` | **GO** |
 | 7 | 角色分工已指定 | Operator/Reviewer/Communicator 打卡机制就位 | ⚠️ 单人，须打卡 | 条件满足，须记录 |
 | 8 | 写入前签发已关闭 | `CLOSED_FOR_WRITES` 经 P3 确认 | ⚠️ 结构满足，P3 确认 | 条件满足，P3 复核 |
 | 9 | 窗口内无管理员/批量签发 + 无公开可用性声明 | 人工确认 | ❌ 人工 | **NO-GO** |
 | 10 | 回滚沟通预案已备 | 负责人 + 模板就位 | ❌ 人工 | **NO-GO** |
-| 11 | HTTP E2E 环境可达 | 可达环境已确认 | ❓ UNKNOWN | **NO-GO** |
+| 11 | HTTP E2E 环境可达 | 可达环境已确认 | ✅ 用户 Mac 本机（浏览器 + curl） | **GO** |
 | 12 | 收到显式授权短语 | 原样提供 §6 短语 | ❌ NO | **NO-GO** |
 | 13 | 双锁凭证就绪 | `--profile jhzy` + `CLOUDFLARE_ACCOUNT_ID` | ✅ YES | GO |
 
@@ -135,12 +172,13 @@
 
 **NO。**
 
-- `READY_FOR_CERT_R5_PRODUCTION_EXECUTION = NO`
+- `READY_FOR_CERT_R5_PRODUCTION_EXECUTION = NO` → **WAITING_FOR_EXPLICIT_AUTHORIZATION**
 - `PRODUCTION_EXECUTION_AUTHORIZED = NO`
-- 阻塞人工项（须全部满足方翻转）：
-  1. 维护窗口具体时间（§1）
-  2. HTTP E2E 可达环境确认（§4.1）
-  3. 显式授权短语（§6）
+- 阻塞人工项状态（CERT-R5-FINAL-PREFLIGHT 更新）：
+  1. 维护窗口具体时间（§1）—— ✅ 已确认 `2026-10-04 02:00–04:00 CST`
+  2. HTTP E2E 可达环境确认（§4.1）—— ✅ 已确认 用户 Mac 本机（浏览器 + curl）
+  3. 显式授权短语（§6）—— ❌ **仍未收到（唯一硬阻塞）**
+- 其余未决人工项（须在 P0 前补齐）：§5 第 9 项（窗口内无签发 / 无公开可用性声明）、第 10 项（回滚沟通预案）。
 
 ---
 
@@ -149,8 +187,10 @@
 | 维度 | 结论 |
 | --- | --- |
 | 技术闸门（快照/源/runner/回归） | ✅ 全过 |
-| 人工条件（窗口/角色/关闭/回滚/E2E/短语） | ❌ 未齐（6 / 13 项 NO-GO） |
-| 综合裁定 | **NO-GO**（技术就绪，人工前置未满足） |
+| 人工条件（窗口/E2E） | ✅ 已确认（§1 / §4.1） |
+| 人工条件（无签发承诺/回滚预案/授权短语） | ❌ 未齐（§5 第 9 / 10 / 12 项 NO-GO） |
+| 综合裁定 | **NO-GO**（技术就绪；仅剩显式授权短语 + 两项运营确认） |
+| 状态语义 | **WAITING_FOR_EXPLICIT_AUTHORIZATION** |
 
 ---
 
@@ -165,6 +205,13 @@
 - 未 push Git
 - 未触达 JHZY 1.0 live
 
-> 本 prep 文档留作 **untracked**，待人工确认后随 R5 证据一并提交（不 push）。
+> 本 prep 文档已提交（commit `07f2444`，不 push）；本轮 FINAL-PREFLIGHT 修订随 R5 证据一并提交（不 push）。
 
-**NEXT_ACTION = STOP. Await explicit human authorization + maintenance window + E2E environment.**
+### CERT-R5-FINAL-PREFLIGHT 补充非突变确认（2026-10-03）
+
+- 仅写入维护窗口 / HTTP E2E 环境 / 授权状态字段
+- 生产 D1 只读复核：migrations 44 / 0045 0 / 0046 0 / certificates 413 / id_pools 500
+- 生产 Worker 只读复核：active version = `e7fcf4a8-f776-44cf-b857-f751924ae2f2`
+- 未 apply 0045/0046；未 import 450k；未 deploy；未变更 secret；未签发证书；未 push
+
+**NEXT_ACTION = STOP. Await explicit human authorization phrase (§6) + 两项运营确认 (§5 #9/#10).**
