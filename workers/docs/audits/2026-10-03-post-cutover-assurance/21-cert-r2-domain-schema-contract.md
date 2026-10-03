@@ -59,7 +59,17 @@
 
 ## 4. §B — 精确索引契约与生产核验
 
-**EXACT_0045_INDEX_CONTRACT**
+> ⚠ **CERT-R3A-FIX 修正告示（2026-10-03）**：本节记录的是 **CERT-R2 当时冻结的原始契约**，
+> 作为 commit `c698e667` 的历史证据保留。**该索引已在 CERT-R3A-FIX 中被修正**（因
+> ACTIVITY/SERVICE 共享 `source_type='activity'` 而 `source_id` 分属不同命名空间，
+> 相同数值会互相误判为重复）。**当前真相**：
+> `ON certificates(user_id, source_type, issue_source, source_id)
+>  WHERE status = 1 AND source_type = 'activity'
+>    AND issue_source IS NOT NULL AND source_id IS NOT NULL`
+> （新增 `certificates.issue_source` 列；0045 仍未在任何环境 APPLY）。
+> 详见 `docs/certificate/certificate-domain-contract.md` §1.3 / §5.1。
+
+**EXACT_0045_INDEX_CONTRACT（CERT-R2 原冻结版本 — 已被 CERT-R3A-FIX 取代）**
 
 ```sql
 CREATE UNIQUE INDEX IF NOT EXISTS uq_cert_user_source

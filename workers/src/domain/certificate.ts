@@ -47,10 +47,11 @@ export type PersistedSourceType = 'course' | 'exam' | 'activity' | 'manual' | nu
  *   1) 生产历史/服务行已存在于既有 'activity' 语义下；新增取值需重估 CHECK
  *      并触及 413 行，违背 ADDITIVE / NON-DESTRUCTIVE 原则。
  *   2) CERT-R2 明确不臆造新 persisted 枚举值。
- *   3) 前缀 'JHCRT-SRV-*' 已足以区分 service 与 activity 证书。
+ *   3) 命名空间判别改由【结构化列 issue_source】承担（见下方 Issue Source 段），
+ *      而非 cert_no 字符串前缀——前缀无 DB 约束、无索引支持，且新旧前缀不同族。
  *
- * 注意：SERVICE 与 ACTIVITY 复用同一 persisted 值，故 uq_cert_user_source
- * （谓词锁定 source_type='activity'）自动同时覆盖二者的幂等防护。
+ * 注意：SERVICE 与 ACTIVITY 复用同一 persisted source_type，故 uq_cert_user_source
+ * 必须（且已）把 issue_source 纳入索引列，方能区分二者的幂等键。
  */
 export enum CertificateSource {
   TRAINING_EXAM = 'exam',
@@ -98,6 +99,65 @@ export function hasAuthoritativeSourceIdentity(sourceId: number | null): boolean
   return sourceId !== null;
 }
 
+// ===== Issue Source（namespace 判别器；CERT-R3A-FIX 新增）=====
+//
+// 【三层不变量】DOMAIN SOURCE → persisted source_type → issue_source → source_id
+//
+//   DOMAIN TRAINING_EXAM → 'exam'     → issue_source = NULL  → exam_sessions.id
+//   DOMAIN COURSE        → 'course'   → issue_source = NULL  → 历史 NULL
+//   DOMAIN ACTIVITY      → 'activity' → issue_source = 'activity' → activities.id
+//   DOMAIN SERVICE       → 'activity' → issue_source = 'service'  → service_records.id
+//   DOMAIN MANUAL/ACCEPT → 'manual'   → issue_source = NULL  → NULL
+//
+// 为何需要这一层（CERT-R3A 证明的缺陷）：
+//   ACTIVITY 与 SERVICE 的 source_type 同为 'activity'，而 source_id 分属
+//   activities.id 与 service_records.id —— 两个独立表的独立 INTEGER PK，数值空间
+//   天然重叠。若幂等键不含 issue_source，「参加活动 #5」与「服务记录 #5」会被判为
+//   同一成就 → 误拒合法发放。故 uq_cert_user_source 键为
+//   (user_id, source_type, issue_source, source_id)。
+//
+// 语义最小化：issue_source 仅承担「source_type 单独不足时的命名空间判别」，
+// 故只有 activity / service 两个值。训练(source_type='exam')、验收('manual')、
+// 历史行(source_id=NULL) 均无需该值，保持 NULL —— 不制造无意义的枚举。
+export type IssueSource = 'activity' | 'service';
+
+/** 域概念 → issue_source 命名空间（null = 该域不需要命名空间判别）。 */
+export const DOMAIN_TO_ISSUE_SOURCE: ReadonlyArray<{
+  domain: CertificateSource;
+  issueSource: IssueSource | null;
+}> = Object.freeze([
+  { domain: CertificateSource.TRAINING_EXAM, issueSource: null },
+  { domain: CertificateSource.COURSE, issueSource: null },
+  { domain: CertificateSource.ACTIVITY, issueSource: 'activity' },
+  { domain: CertificateSource.MANUAL, issueSource: null },
+  { domain: CertificateSource.SERVICE, issueSource: 'service' },
+]);
+
+/** 某域概念对应的 issue_source（null 表示不适用，历史/训练/验收保持 NULL）。 */
+export function issueSourceFor(domain: CertificateSource): IssueSource | null {
+  const hit = DOMAIN_TO_ISSUE_SOURCE.find((m) => m.domain === domain);
+  if (!hit) throw new Error(`unknown certificate source domain: ${domain}`);
+  return hit.issueSource;
+}
+
+/**
+ * 该行是否参与 uq_cert_user_source 约束。
+ * 需同时满足：status=1、source_type='activity'、issue_source 非空、source_id 非空。
+ */
+export function isIdempotencyProtected(row: {
+  status: number;
+  sourceType: PersistedSourceType;
+  issueSource: string | null;
+  sourceId: number | null;
+}): boolean {
+  return (
+    row.status === 1 &&
+    row.sourceType === 'activity' &&
+    row.issueSource !== null &&
+    row.sourceId !== null
+  );
+}
+
 
 // ===== Kind（种类；certificates.cert_kind 列）=====
 export enum CertificateKind {
@@ -139,6 +199,7 @@ export interface CertificateRecord {
   certType: string;
   sourceType: PersistedSourceType;
   sourceId: number | null;
+  issueSource: IssueSource | null; // 命名空间判别器（历史/训练/验收为 NULL）
   userId: number;
   teamId: number;
   certKind: CertificateKind;
@@ -156,6 +217,7 @@ export interface CertificateIssueRequest {
   teamId: number;
   sourceType: PersistedSourceType;
   sourceId: number | null;
+  issueSource?: IssueSource | null; // 域 ACTIVITY='activity' / SERVICE='service'；其余省略
   certType: 'training' | 'activity' | 'honor';
   templateId: number;
   certKind: CertificateKind;
@@ -190,25 +252,19 @@ export interface CertificateBatchSummary {
 
 // ===== Number allocator contract（§11 / §H；CERT-R2 仅接口/契约）=====
 //
-// ACTIVITY_NUMBER_FORMAT_DECISION = DEFERRED_TO_CERT_R3
+// ACTIVITY/SERVICE POOL STRATEGY = candidate reuse of cert_srv
+//   id_pools.pool_type CHECK = ('cert_trn','cert_srv','cert_hon','volunteer')
+//   —— 'cert_srv' 保留 V1.0 服务证书语义且在 CHECK 内 → 可作候选池，零迁移、零表重建。
+//   —— 不新建 'cert_act'（违反 CHECK；扩展需重建 id_pools 表，违背 ADDITIVE）。
 //
-// 理由（基于 2026-10-03 生产只读证据）：
-//   1) id_pools.pool_type CHECK = ('cert_trn','cert_srv','cert_hon','volunteer')
-//      —— 不含 'cert_act'；INSERT 'cert_act' 会违反 CHECK。禁止重建 id_pools
-//      （重建违反 ADDITIVE / NON-DESTRUCTIVE），禁止修改其 CHECK。
-//   2) 生产 55 张 service 证书使用字母数字 cert_no 前缀 'JHCRT-SRV-*'，
-//      并非 id_pools 的 pool code 模式 → 现状并非「缺一个池」那么简单。
-//   3) 检索既有权威产品规则：未发现已确立的 activity 证书对外编号规则。
-//      CERT-R1 曾提议 CACT%06d，但该提议与生产现实（CHECK 无 cert_act、
-//      service 用 JHCRT-SRV-*）冲突，且 CERT-R1 自身将其标为 design-only。
-//      → 不构成「EXISTING_RULE_FOUND」。
-//   故 CERT-R2 【不选择】任何新的对外可见 activity 证书前缀，避免臆造对外契约。
-//   CERT-R3 决策二选一：
-//     选项 A = 新迁移扩展 id_pools CHECK 新增 'cert_act'/'cert_svc' 并播种池
-//     选项 B = 对齐生产既有 'JHCRT-SRV-*' 字母数字约定
+// EXTERNAL NUMBER FORMAT = DEFERRED_TO_CERT_R3B
+//   理由：① V2 唯一运行格式为 CTRN%06d（0022 播种）；② V1.0 的 JHCRT-* 未在 V2 落地，
+//   且历史上已产生 cert_no 碰撞；③ 无权威既有 V2 规则可循。
+//   → 先定池（cert_srv 候选），后定格式（CERT-R3B 分配器实现决策）。
+//   本轮【不播种 cert_srv、不改 id_pools、不臆造对外编号】。
 //
 // 现状：training 发放仍使用既有 cert_trn 池（CTRN%06d），本轮完全不变。
-export type CertNumberPoolType = 'cert_trn' | 'cert_act' | 'cert_svc' | 'cert_hon';
+export type CertNumberPoolType = 'cert_trn' | 'cert_srv' | 'cert_hon';
 
 export interface CertificateNumberAllocator {
   /**

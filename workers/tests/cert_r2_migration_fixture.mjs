@@ -27,10 +27,13 @@
  *   区分在断言中显式标注。
  *
  *   - 执行【真实】migrations/0045_certificate_domain_contract.sql。
- *   - 断言：计数 / cert_no / user / source / status 不变；8 组 course 重复保留；
- *     NULL-source activity 保留；索引创建；新列 + 默认值；cert_act 池未播种；
- *     logs/batches schema；考试发卡列清单仍可用（回归）；幂等强制（含 revoked
- *     状态策略）；CHECK 强制；验收种类可写。
+ *   - 断言：计数 / cert_no / user / source_type / source_id / status 不变；8 组 course 重复保留；
+ *     NULL-source activity 保留；索引创建（含 issue_source 键与双 NOT NULL 谓词）；新列 + 默认值；
+ *     cert_act / cert_srv 池未播种；logs/batches schema；考试发卡列清单仍可用（回归）；
+ *     幂等强制（含 revoked 状态策略）；issue_source CHECK 强制；验收种类可写；
+ *     ★ 命名空间碰撞矩阵（§8，CERT-R3A-FIX 核心验收）：
+ *       同 user + 同数值 source_id + 同 source_type，issue_source='activity' 与
+ *       'service' 必须【都插入成功】；各命名空间内部的第 2 张 active 必须被 UNIQUE 拒绝。
  *
  * 全部 synthetic fixture；无 production / staging 写入；无真实 PII。
  */
@@ -212,6 +215,16 @@ try {
 }
 check('迁移 0045 执行成功（无报错）', migrationOk);
 
+// CERT-R3A-FIX：命名空间感知插入器（issue_source 于迁移后才有，故在此处 prepare）
+let insertCertNs = null;
+if (migrationOk) {
+  insertCertNs = db.prepare(
+    `INSERT INTO certificates (public_id, cert_no, verify_code, template_id, user_id, team_id,
+       cert_type, source_type, source_id, issue_source, exam_paper_id, holder_name, issuer_name, snapshot, status, issued_at)
+     VALUES (?, ?, ?, 1, ?, 1, ?, ?, ?, ?, NULL, NULL, NULL, NULL, 1, 1700000000)`,
+  );
+}
+
 // ===== 断言：既有 413 不变 =====
 const total = db.prepare('SELECT COUNT(*) n FROM certificates').get().n;
 check('证书总数不变 = 413', total === 413, `got ${total}`);
@@ -259,13 +272,23 @@ const idxExists = db
   .get().n;
 check('uq_cert_user_source 索引已创建', idxExists === 1, `got ${idxExists}`);
 
-// 索引谓词与生产一致：确认 sqlite_master 中记录的谓词含 source_id IS NOT NULL
+// 索引谓词与生产一致：确认 sqlite_master 中记录的谓词含两个 NOT NULL 排除
 const idxSql = db
   .prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name='uq_cert_user_source'")
   .get().sql;
 check(
   '索引谓词显式排除 source_id IS NOT NULL（只保护有权威 source 的行）',
   /source_id IS NOT NULL/i.test(idxSql),
+  idxSql,
+);
+check(
+  '索引谓词显式排除 issue_source IS NOT NULL（只保护已声明命名空间的行）',
+  /issue_source IS NOT NULL/i.test(idxSql),
+  idxSql,
+);
+check(
+  '索引键含 issue_source 列（activity/service 命名空间判别）',
+  /\(\s*user_id\s*,\s*source_type\s*,\s*issue_source\s*,\s*source_id\s*\)/i.test(idxSql),
   idxSql,
 );
 check(
@@ -277,11 +300,20 @@ check(
 // 迁移后、测试写入前，按【精确索引谓词】统计冲突组 = 0
 const exactPredConflicts = db
   .prepare(`SELECT COUNT(*) n FROM (
-    SELECT user_id, source_type, source_id FROM certificates
-    WHERE status = 1 AND source_type = 'activity' AND source_id IS NOT NULL
-    GROUP BY user_id, source_type, source_id HAVING COUNT(*) > 1)`)
+    SELECT user_id, source_type, issue_source, source_id FROM certificates
+    WHERE status = 1 AND source_type = 'activity'
+      AND issue_source IS NOT NULL AND source_id IS NOT NULL
+    GROUP BY user_id, source_type, issue_source, source_id HAVING COUNT(*) > 1)`)
   .get().n;
 check('迁移后精确索引谓词冲突组 = 0（与生产核验一致）', exactPredConflicts === 0, `got ${exactPredConflicts}`);
+
+// ===== CERT-R3A-FIX：issue_source 列存在性与历史兼容 =====
+const colsAfter = db.prepare('PRAGMA table_info(certificates)').all().map((c) => c.name);
+check('certificates 含新列 issue_source', colsAfter.includes('issue_source'), `cols=${colsAfter.join(',')}`);
+const legacyIssueSrcNull = db
+  .prepare('SELECT COUNT(*) n FROM certificates WHERE issue_source IS NULL')
+  .get().n;
+check('全部 413 历史行 issue_source = NULL（未回填、未改写）', legacyIssueSrcNull === 413, `got ${legacyIssueSrcNull}`);
 
 // 新索引不影响历史 exam/course 维度：8 组重复在索引列/谓词外，原样保留
 const dupStillThere = db
@@ -335,14 +367,16 @@ try {
 }
 check('考试发卡 INSERT 列清单迁移后仍可用（cert_kind 默认 participant）', examRegressionOk);
 
-// ===== 幂等强制：同 (user, activity, source_id) 重复插入应被唯一索引拒绝 =====
-// §F 负向矩阵：第 1 张有效 activity/service 成就证书 → 成功；同成就第 2 张 active → DB UNIQUE 拒绝；
-// 不同 user → 允许；不同 source_id → 允许；legacy source_id=NULL → 不破坏迁移；
+// ===== 幂等强制：同命名空间内重复插入应被唯一索引拒绝 =====
+// §F 负向矩阵（issue_source 为 CERT-R3A-FIX 后索引键的必需维度，故改用 insertCertNs）：
+// 第 1 张有效成就证书 → 成功；同命名空间第 2 张 active → DB UNIQUE 拒绝；
+// 不同 user → 允许；不同 source_id → 允许；legacy NULL → 不破坏迁移；
 // 历史 exam/course 重复形态 → 不被新约束改动。
 let firstInsertOk = true;
 try {
   const id = nextIds();
-  insertCert.run(id.public_id, id.cert_no, id.verify_code, 600, 'activity', 'activity', 700); // (user600, act700) 第 1 张
+  // (user600, issue_source=activity, source_id=700) 第 1 张
+  insertCertNs.run(id.public_id, id.cert_no, id.verify_code, 600, 'activity', 'activity', 700, 'activity');
 } catch (e) {
   firstInsertOk = false;
   process.stderr.write(`  FIRST VALID INSERT ERROR: ${e}\n`);
@@ -352,16 +386,17 @@ check('§F 首张有效 activity 成就证书 INSERT 成功', firstInsertOk);
 let idempotentRejected = false;
 try {
   const id = nextIds();
-  insertCert.run(id.public_id, id.cert_no, id.verify_code, 600, 'activity', 'activity', 700); // 同 (user600,act700) 第 2 张 active
+  // 同 (user600, activity, source_id=700) 第 2 张 active
+  insertCertNs.run(id.public_id, id.cert_no, id.verify_code, 600, 'activity', 'activity', 700, 'activity');
 } catch (e) {
   idempotentRejected = /UNIQUE|constraint/i.test(String(e));
 }
-check('§F 同成就第 2 张 active 证书被 DB UNIQUE 拒绝', idempotentRejected);
+check('§F 同命名空间同成就第 2 张 active 证书被 DB UNIQUE 拒绝', idempotentRejected);
 
 let diffUserOk = true;
 try {
   const id = nextIds();
-  insertCert.run(id.public_id, id.cert_no, id.verify_code, 601, 'activity', 'activity', 700); // 不同 user，同 source
+  insertCertNs.run(id.public_id, id.cert_no, id.verify_code, 601, 'activity', 'activity', 700, 'activity'); // 不同 user，同 source
 } catch (e) {
   diffUserOk = false;
   process.stderr.write(`  DIFF USER ERROR: ${e}\n`);
@@ -371,7 +406,7 @@ check('§F 不同 user 同 source_id 允许（约束不误伤）', diffUserOk);
 let diffSourceOk = true;
 try {
   const id = nextIds();
-  insertCert.run(id.public_id, id.cert_no, id.verify_code, 600, 'activity', 'activity', 701); // 同 user，不同 source_id
+  insertCertNs.run(id.public_id, id.cert_no, id.verify_code, 600, 'activity', 'activity', 701, 'activity'); // 同 user，不同 source_id
 } catch (e) {
   diffSourceOk = false;
   process.stderr.write(`  DIFF SOURCE ERROR: ${e}\n`);
@@ -383,15 +418,134 @@ check('§F 同 user 不同 source_id 允许（按成就粒度唯一）', diffSou
 // 故撤销后的同一成就可重新发证（不违反唯一性）——此为从 schema 推导的策略，非假设。
 let revokeReissueOk = true;
 try {
-  db.prepare("UPDATE certificates SET status=2 WHERE user_id=600 AND source_type='activity' AND source_id=700 AND cert_kind='participant'").run();
+  db.prepare("UPDATE certificates SET status=2 WHERE user_id=600 AND issue_source='activity' AND source_id=700 AND status=1").run();
   const id = nextIds();
   // 撤销后对同一成就重新发证应被允许（status=1 新行，谓词不命中旧 status=2 行）
-  insertCert.run(id.public_id, id.cert_no, id.verify_code, 600, 'activity', 'activity', 700);
+  insertCertNs.run(id.public_id, id.cert_no, id.verify_code, 600, 'activity', 'activity', 700, 'activity');
 } catch (e) {
   revokeReissueOk = false;
   process.stderr.write(`  REVOKE/REISSUE ERROR: ${e}\n`);
 }
 check('§F status=2(revoked) 不参与唯一性 → 撤销后可重发同一成就', revokeReissueOk);
+
+// ============================================================================
+// §8 CERT-R3A-FIX 核心验收：命名空间碰撞测试
+//
+// 缺陷背景：域 ACTIVITY 与域 SERVICE 同持久化为 source_type='activity'，其 source_id
+// 分属 activities.id 与 service_records.id（两个独立表的独立 INTEGER PK，数值空间
+// 重叠）。旧索引键 (user_id, source_type, source_id) 会把「活动 #900」与「服务记录
+// #900」误判为同一成就。修正后键含 issue_source，二者必须都能成功插入。
+// ============================================================================
+
+// (1) 同一 user + 同一数值 source_id + 同一 source_type，但 issue_source 不同 → 必须都成功
+let nsActivityOk = true;
+try {
+  const id = nextIds();
+  // 域 ACTIVITY：source_id = activities.id = 900
+  insertCertNs.run(id.public_id, id.cert_no, id.verify_code, 700, 'activity', 'activity', 900, 'activity');
+} catch (e) {
+  nsActivityOk = false;
+  process.stderr.write(`  NS ACTIVITY ERROR: ${e}\n`);
+}
+check('§8 命名空间：域 ACTIVITY (issue_source=activity, source_id=900) 插入成功', nsActivityOk);
+
+let nsServiceOk = true;
+try {
+  const id = nextIds();
+  // 域 SERVICE：source_id = service_records.id = 900（与上面数值相同！）
+  insertCertNs.run(id.public_id, id.cert_no, id.verify_code, 700, 'activity', 'activity', 900, 'service');
+} catch (e) {
+  nsServiceOk = false;
+  process.stderr.write(`  NS SERVICE ERROR: ${e}\n`);
+}
+check('§8 关键：同 user 同 source_id(900) 但 issue_source=service → 同样插入成功（不误判重复）', nsServiceOk);
+
+// (2) 同 user + 同 source_type + 同 issue_source + 同 source_id 的第 2 张 active → 必须 UNIQUE 拒绝
+let nsDupActivityRejected = false;
+try {
+  const id = nextIds();
+  insertCertNs.run(id.public_id, id.cert_no, id.verify_code, 700, 'activity', 'activity', 900, 'activity');
+} catch (e) {
+  nsDupActivityRejected = /UNIQUE|constraint/i.test(String(e));
+}
+check('§8 命名空间内重复：同 activity 命名空间同 source_id 第 2 张 active 被 UNIQUE 拒绝', nsDupActivityRejected);
+
+let nsDupServiceRejected = false;
+try {
+  const id = nextIds();
+  insertCertNs.run(id.public_id, id.cert_no, id.verify_code, 700, 'activity', 'activity', 900, 'service');
+} catch (e) {
+  nsDupServiceRejected = /UNIQUE|constraint/i.test(String(e));
+}
+check('§8 命名空间内重复：同 service 命名空间同 source_id 第 2 张 active 被 UNIQUE 拒绝', nsDupServiceRejected);
+
+// (3) 不同 user：允许
+let nsDiffUserOk = true;
+try {
+  const id = nextIds();
+  insertCertNs.run(id.public_id, id.cert_no, id.verify_code, 701, 'activity', 'activity', 900, 'activity');
+} catch (e) {
+  nsDiffUserOk = false;
+  process.stderr.write(`  NS DIFF USER ERROR: ${e}\n`);
+}
+check('§8 不同 user 同命名空间同 source_id 允许', nsDiffUserOk);
+
+// (4) 不同 source_id：允许
+let nsDiffSourceOk = true;
+try {
+  const id = nextIds();
+  insertCertNs.run(id.public_id, id.cert_no, id.verify_code, 700, 'activity', 'activity', 901, 'activity');
+} catch (e) {
+  nsDiffSourceOk = false;
+  process.stderr.write(`  NS DIFF SOURCE ERROR: ${e}\n`);
+}
+check('§8 同 user 同命名空间不同 source_id 允许', nsDiffSourceOk);
+
+// (5) legacy 行 issue_source=NULL：允许（不参与唯一性）
+let nsLegacyNullIssueSrcOk = true;
+try {
+  const id = nextIds();
+  insertCertNs.run(id.public_id, id.cert_no, id.verify_code, 700, 'activity', 'activity', 902, null);
+} catch (e) {
+  nsLegacyNullIssueSrcOk = false;
+  process.stderr.write(`  NS LEGACY NULL ERROR: ${e}\n`);
+}
+check('§8 legacy 行 issue_source=NULL 允许（不在谓词内，不受约束）', nsLegacyNullIssueSrcOk);
+
+// 连续两条 legacy NULL issue_source 且同 source_id 也应允许（NULL 互异 + 谓词排除双重保障）
+let nsLegacyTwiceOk = true;
+try {
+  const id = nextIds();
+  insertCertNs.run(id.public_id, id.cert_no, id.verify_code, 700, 'activity', 'activity', 902, null);
+} catch (e) {
+  nsLegacyTwiceOk = false;
+  process.stderr.write(`  NS LEGACY TWICE ERROR: ${e}\n`);
+}
+check('§8 legacy 同 source_id 两条 NULL issue_source 均允许', nsLegacyTwiceOk);
+
+// (6) legacy NULL source_id 行：允许
+let nsNullSourceIdOk = true;
+try {
+  const id = nextIds();
+  insertCertNs.run(id.public_id, id.cert_no, id.verify_code, 700, 'activity', 'activity', null, 'activity');
+} catch (e) {
+  nsNullSourceIdOk = false;
+  process.stderr.write(`  NS NULL SOURCE_ID ERROR: ${e}\n`);
+}
+check('§8 source_id=NULL 的 activity 行允许（不在谓词内）', nsNullSourceIdOk);
+
+// (7) 撤销策略在命名空间维度仍成立：service 命名空间撤销后可重发
+let nsRevokeOk = true;
+try {
+  db.prepare("UPDATE certificates SET status=2 WHERE user_id=700 AND issue_source='activity' AND source_id=900 AND status=1").run();
+  const id = nextIds();
+  insertCertNs.run(id.public_id, id.cert_no, id.verify_code, 700, 'activity', 'activity', 900, 'activity');
+} catch (e) {
+  nsRevokeOk = false;
+  process.stderr.write(`  NS REVOKE ERROR: ${e}\n`);
+}
+check('§8 命名空间维度：status=2(revoked) 不参与唯一性 → 可重发', nsRevokeOk);
+
 
 // ===== NULL source_id activity 仍可插入（系统账号服务种子不冲突）=====
 let nullSourceOk = true;
@@ -416,6 +570,17 @@ try {
   kindCheckOk = /CHECK|constraint/i.test(String(e));
 }
 check('cert_kind CHECK 强制（bogus 被拒）', kindCheckOk);
+
+// issue_source CHECK 强制（置于末尾：避免污染前面的 413 历史计数断言）
+let issueSourceCheckOk = false;
+try {
+  const id = nextIds();
+  insertCertNs.run(id.public_id, id.cert_no, id.verify_code, 1, 'activity', 'activity', 1, 'activity');
+  db.prepare("UPDATE certificates SET issue_source='bogus' WHERE public_id=?").run(id.public_id);
+} catch (e) {
+  issueSourceCheckOk = /CHECK|constraint/i.test(String(e));
+}
+check('issue_source CHECK 强制（bogus 被拒）', issueSourceCheckOk);
 
 let logResultCheckOk = false;
 try {

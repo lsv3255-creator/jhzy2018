@@ -49,17 +49,48 @@ enum 就发明新的 persisted source_type。**
 | `COURSE` | `'course'` | 课程证书（历史 358 张主体） |
 | `ACTIVITY` | `'activity'` | 活动证书 |
 | `MANUAL` | `'manual'` | 手动/后台补发 |
-| `SERVICE` | `'activity'` | **生产现实**：service 复用 `'activity'`，以 `cert_no` 前缀 `JHCRT-SRV-*` 区分 |
+| `SERVICE` | `'activity'` | **生产现实**：service 复用 `'activity'` |
 
 > 映射为**多对一**（`ACTIVITY` 与 `SERVICE` 共享 `'activity'`）。`src/domain/certificate.ts`
 > 以数组 + `persistedSourceFor()` / `domainSourcesFor()` 表达，**不用对象字面量**（避免 TS1117
 > 重复键 —— 该冲突由 typecheck 实际捕获并修复）。
 >
 > **SERVICE 不获独立 source_type 的理由**：(1) 新增取值需重估 CHECK 并触及 413 行，违背
-> ADDITIVE/NON-DESTRUCTIVE；(2) CERT-R2 不臆造新 persisted 枚举；(3) `JHCRT-SRV-*` 前缀已足够区分。
+> ADDITIVE/NON-DESTRUCTIVE；(2) CERT-R2 不臆造新 persisted 枚举。
 >
-> **推论**：因二者复用同一 persisted 值，`uq_cert_user_source`（谓词锁定
-> `source_type='activity'`）**自动同时覆盖** activity 与 service 的幂等防护。
+> ⚠ **CERT-R3A 修正**：CERT-R2 曾以「`cert_no` 前缀已足以区分」作为该设计成立的充分理由。
+> 该理由**不成立** —— 前缀无 DB 约束、无索引支持，且新旧前缀不同族。ACTIVITY 与 SERVICE
+> 的判别改由**结构化列 `issue_source`** 承担（见 §1.3）。
+
+### 1.3 第 3 层 —— ISSUE_SOURCE（命名空间判别器，CERT-R3A-FIX 新增）
+
+**持久化列**：`certificates.issue_source TEXT`
+`CHECK (issue_source IS NULL OR issue_source IN ('activity','service'))`
+
+**存在理由**：ACTIVITY 与 SERVICE 的 `source_type` 同为 `'activity'`，而 `source_id` 分属
+`activities.id` 与 `service_records.id` —— **两个独立表的独立 INTEGER PRIMARY KEY，数值空间
+天然重叠**。若幂等键不含 `issue_source`，「参加活动 #5」与「服务记录 #5」会被判为同一成就
+→ 误拒合法发放。
+
+**三层不变量（DOMAIN → source_type → issue_source → source_id）**：
+
+| 域 | `source_type` | `issue_source` | `source_id` |
+| --- | --- | --- | --- |
+| `TRAINING_EXAM` | `'exam'` | **NULL** | `exam_sessions.id` |
+| `COURSE`（历史） | `'course'` | **NULL** | NULL |
+| `ACTIVITY` | `'activity'` | **`'activity'`** | `activities.id` |
+| `SERVICE` | `'activity'` | **`'service'`** | `service_records.id` |
+| `MANUAL` / `ACCEPTANCE` | `'manual'` | **NULL** | NULL（强制） |
+
+**语义最小化**：`issue_source` **只**承担「`source_type` 单独不足时的命名空间判别」，故仅
+`activity` / `service` 两个值。训练（`source_type='exam'`，其幂等已由 `uq_cert_user_paper`
+以 `exam_paper_id` 承担）、验收（`'manual'`，`source_id` 恒 NULL）、历史行（`source_id` 恒 NULL）
+**均不需要该值**，保持 NULL —— 不制造无意义的枚举。
+
+**历史兼容**：生产 413 行 `source_id` 与 `issue_source` **均为 NULL** → 不回填、不 UPDATE、
+不改写、不伪造；全部落在索引谓词之外，不受约束。
+
+> 域层辅助函数：`issueSourceFor(domain)`、`isIdempotencyProtected(row)`（`src/domain/certificate.ts`）。
 
 ---
 
@@ -116,26 +147,30 @@ CHECK (cert_kind IN ('participant','acceptance'))`（migration 0045 M1）。
 
 ## 5. 活动/服务幂等防护契约（Idempotency）
 
-### 5.1 EXACT_0045_INDEX_CONTRACT（精确索引契约）
+### 5.1 EXACT_0045_INDEX_CONTRACT（精确索引契约，CERT-R3A-FIX 修正版）
 
 ```sql
 CREATE UNIQUE INDEX IF NOT EXISTS uq_cert_user_source
-  ON certificates(user_id, source_type, source_id)
-  WHERE status = 1 AND source_type = 'activity' AND source_id IS NOT NULL;
+  ON certificates(user_id, source_type, issue_source, source_id)
+  WHERE status = 1 AND source_type = 'activity'
+    AND issue_source IS NOT NULL AND source_id IS NOT NULL;
 ```
 
 | 维度 | 定义 |
 | --- | --- |
-| **columns** | `(user_id, source_type, source_id)` |
-| **predicate** | `WHERE status = 1 AND source_type = 'activity' AND source_id IS NOT NULL` |
-| **覆盖 source_type** | 仅 `'activity'`（含复用 `'activity'` 的 service）。**排除** `course` / `exam` / `manual` / `NULL` |
+| **columns** | `(user_id, source_type, issue_source, source_id)` |
+| **predicate** | `WHERE status = 1 AND source_type = 'activity' AND issue_source IS NOT NULL AND source_id IS NOT NULL` |
+| **覆盖 source_type** | 仅 `'activity'`（含复用它的 service）。**排除** `course` / `exam` / `manual` / `NULL` |
 | **status 行为** | `status CHECK(1,2)`，1=active / 2=revoked。谓词仅锁 `status=1`；已撤销(2)证书不参与唯一性 → 撤销后可对同一成就重发（策略由 schema 推导，非假设） |
-| **NULL 行为** | 显式排除 `source_id IS NULL`。无权威 source identity 的行永不进入索引、不受约束、不阻塞迁移 |
-| **legacy 兼容** | 生产 413 张证书 `source_id` **全为 NULL**，全部落在谓词之外 → 索引可安全创建，0 行历史数据被改动 |
+| **NULL 行为** | **两个维度均显式排除**：`source_id IS NULL`（无权威 source identity）与 `issue_source IS NULL`（未声明命名空间）。二者任一为 NULL 即不受约束 |
+| **为何必须含 issue_source** | ACTIVITY 与 SERVICE 同为 `'activity'` 但 source_id 命名空间不同（`activities.id` vs `service_records.id`），相同数值会互相误判 |
+| **legacy 兼容** | 生产 413 张证书 `source_id` 与 `issue_source` **均为 NULL**，全部落在谓词之外 → 索引可安全创建，0 行历史数据被改动 |
 
-> **为何不裸用 `UNIQUE(user_id, source_type, source_id)`**：那会把无 source identity 的
-> legacy/service 行（`source_id IS NULL`）纳入约束语义。本索引**只保护具备权威 source
-> identity 的成就行**，legacy 行完全不受影响。
+> **为何不裸用 `UNIQUE(user_id, source_type, source_id)`**：那既会把无 source identity 的
+> legacy 行纳入约束语义，也会把「活动 #5」与「服务记录 #5」误判为同一成就。
+>
+> **0045 源修订**：因 0045 从未远端应用，本定义**直接替换**原三列版本，
+> 未新增 0046，未引入 `DROP INDEX` 编排。commit `c698e667` 保留原契约作为历史证据。
 
 ### 5.2 生产只读核验（2026-10-03，`rows_written=0`）
 
@@ -148,9 +183,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_cert_user_source
 > 结论：索引创建**不会**触达 §31 STOP 条件。冲突数为 0，是因为**非 NULL 冲突集本身为空**
 > （存量行均无权威 source identity），而非因为冲突已被解决。
 
-### 5.3 应用层（CERT-R3 的 `issue()` 原语）
-以 `NOT EXISTS (certificates WHERE user_id=? AND source_type=? AND source_id=? AND status=1
-AND source_id IS NOT NULL)` 谓词在事务内先行校验，对齐 `exam.ts submitAndMaybeIssueAtomically` 模式。
+### 5.3 应用层（CERT-R3B 的 `issue()` 原语）
+以 `NOT EXISTS (certificates WHERE user_id=? AND source_type='activity' AND issue_source=?
+AND source_id=? AND status=1)` 谓词在事务内先行校验，对齐 `exam.ts submitAndMaybeIssueAtomically` 模式。
 
 ---
 
@@ -169,8 +204,18 @@ AND source_id IS NOT NULL)` 谓词在事务内先行校验，对齐 `exam.ts sub
 故 CERT-R2 **不选择**任何新的对外可见 activity 证书前缀。现状 training 发放仍用既有
 `cert_trn` 池（`CTRN%06d`），**完全不变**。
 
+> **CERT-R3A-FIX 治理更正**：
+> - `ACTIVITY/SERVICE POOL STRATEGY` = **candidate reuse of `cert_srv`**
+>   （`'cert_srv'` 保留 V1.0 服务证书语义且在既有 CHECK 内 → 零迁移、零表重建；
+>   不新建 `cert_act`，因扩展 CHECK 需重建 `id_pools` 表，违背 ADDITIVE）。
+> - `EXTERNAL NUMBER FORMAT` = **`DEFERRED_TO_CERT_R3B`**
+>   （CERT-R3A 曾提出 `CSRV%06d`，本 Gate **不冻结**：V2 唯一运行格式为 `CTRN%06d`，
+>   V1.0 的 `JHCRT-*` 未在 V2 落地且历史已现 cert_no 碰撞，无权威既有 V2 规则可循。
+>   **先定池、后定格式**。）
+> - 本轮**不播种 `cert_srv`、不改 `id_pools`、不臆造对外编号**。
+
 ```ts
-export type CertNumberPoolType = 'cert_trn' | 'cert_act' | 'cert_svc' | 'cert_hon';
+export type CertNumberPoolType = 'cert_trn' | 'cert_srv' | 'cert_hon';
 export interface CertificateNumberAllocator {
   allocate(poolType: CertNumberPoolType, txn: {
     run(sql: string, bind: unknown[]): Promise<{ changes: number }>;
@@ -178,9 +223,7 @@ export interface CertificateNumberAllocator {
 }
 ```
 
-**CERT-R3 决策二选一**：
-- 选项 A = 新迁移扩展 `id_pools` CHECK 新增 `cert_act`/`cert_svc` 并播种池
-- 选项 B = 对齐生产既有 `JHCRT-SRV-*` 字母数字约定
+**CERT-R3B 待决**：池种子形态与对外编号格式（分配器实现范畴，独立迁移 Gate）。
 
 ---
 
@@ -237,10 +280,11 @@ CREATE TABLE IF NOT EXISTS certificate_batches (
   - **业务列零修改**：`cert_no` / `user_id` / `team_id` / `source_type` / `source_id` /
     `status` / `cert_type` 均不变（fixture 以迁移前绑定快照比对证明 0 mutation）。
   - 新增列取默认值：`cert_kind='participant'`（真实语义）、`issue_reason=NULL`（域层映射
-    `legacy`）、`issued_by=NULL`、`revoked_*=NULL`、`file_id` 保持原值。
-  - **全部 413 行 `source_id` 为 NULL** → 全部落在新索引谓词之外，不受约束、不阻塞迁移。
+    `legacy`）、`issued_by=NULL`、`revoked_*=NULL`、`issue_source=NULL`、`file_id` 保持原值。
+  - **全部 413 行 `source_id` 与 `issue_source` 均为 NULL** → 全部落在新索引谓词之外，
+    不受约束、不阻塞迁移。
 - 本地 fixture 验证：`413 → 413`，`cert_no` 不变，user/source 绑定 0 mutation，8 组 dup
-  保留，legacy NULL-source 行保留。
+  保留，legacy NULL-source 行保留，`issue_source` 历史行全 NULL。
 
 ---
 
@@ -279,11 +323,12 @@ export function assertNotSystemUser(userId: number, isSystem: boolean): void {
 | CERT-R1 决策 | CERT-R2 落地 |
 | --- | --- |
 | M1 cert_kind/issued_by/issue_reason/revoke_* | ✅ 0045 M1 |
-| M2 uq_cert_user_source | ✅ 0045 M2（经生产只读核验安全） |
-| M3 播种 cert_act/cert_svc 池 | ⚠️ **偏离**：本轮不播种（理由：id_pools CHECK 无 cert_act；生产用 JHCRT-SRV-* 非 pool 模式）。仅落接口，决策推迟 CERT-R3（见 §6） |
+| M1 **issue_source**（命名空间判别器） | ✅ **0045 M1（CERT-R3A-FIX 增补）** |
+| M2 uq_cert_user_source | ✅ 0045 M2（**CERT-R3A-FIX 已修正为四列键**） |
+| M3 播种 cert_act/cert_svc 池 | ⚠️ **偏离**：不播种（CHECK 无 `cert_act`）。池策略 = 候选复用 `cert_srv`；格式 `DEFERRED_TO_CERT_R3B`（§6） |
 | M4 certificate_logs 扩展 | ✅ 0045 M4 |
 | M5 certificate_batches 表 | ✅ 0045 M5 |
-| 提取共享 issue 原语 | ⏭️ CERT-R3（本轮仅接口，§12） |
+| 提取共享 issue 原语 | ⏭️ CERT-R3B（本轮仅接口，§12） |
 | 验收证书区分 | ✅ §2 / §10 |
 | 系统账号守卫 | ✅ §13 |
 | 考试发卡回归契约 | ✅ 0045 不改动 exam.ts；fixture 验证 5 步 INSERT 列清单不变 |
