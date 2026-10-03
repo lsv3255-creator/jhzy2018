@@ -26,8 +26,10 @@
 // =============================================================================
 import { createHash } from 'node:crypto';
 import { gunzipSync } from 'node:zlib';
-import { readFileSync, existsSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
+import { readFileSync, existsSync, mkdirSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -452,10 +454,150 @@ export async function runLegacyPoolImportRunner(config) {
 }
 
 // =============================================================================
-// CLI（默认不写；仅 plan/dry-run 安全；execute 需显式确认）
+// CERT-R5A —— 真实接线（source parser + D1 适配器 + 编译后的 importer）
+//
+// ⚠ R5 原 CLI 为「空转守卫桩」：只打印常量并 exit 0，从未读取归档、从未解析
+//   450,000 行、从未校验源统计、从未连接 D1 → 其 exit 0 属伪通过。
+//   本段将其替换为真实实现：plan / dry-run 必须真实解析源；execute 仍需完整确认。
 // =============================================================================
+import { loadLegacySource, formatStats } from './legacy-pool-source-parser.mjs';
+import { createLocalSqliteD1, createRemoteD1Adapter, ID_POOLS_SCHEMA } from './d1-executor-adapters.mjs';
+
+/** 默认离线归档（WP4-D 权威快照）；禁用任何 live JHZY 1.0 源。 */
+export const DEFAULT_SOURCE_ARCHIVE = GUARDS.SOURCE_ARCHIVE;
+
+const IMPORTER_TS = join(__dirname, '..', 'src', 'services', 'legacy-pool-importer.ts');
+const IMPORTER_OUT = join(__dirname, '..', 'tmp', '_r5a', 'legacy-pool-importer.mjs');
+
+/**
+ * 用 esbuild 把 TypeScript importer 转译为可 import 的 ESM（缓存在 gitignored tmp/）。
+ * 失败即 fail-closed —— 绝不使用「镜像实现」替代真实 importer 执行生产写入。
+ */
+export async function compileImporter({ force = false } = {}) {
+  if (!force && existsSync(IMPORTER_OUT)) return import(pathToFileURL(IMPORTER_OUT).href);
+  mkdirSync(dirname(IMPORTER_OUT), { recursive: true });
+  const esbuild = await import('esbuild');
+  await esbuild.build({
+    entryPoints: [IMPORTER_TS],
+    outfile: IMPORTER_OUT,
+    format: 'esm',
+    platform: 'neutral',
+    target: 'node22',
+    bundle: true,
+    logLevel: 'silent',
+  });
+  return import(pathToFileURL(IMPORTER_OUT).href);
+}
+
+/** 把解析出的 legacy rows 交给【真实】importLegacyPools 执行（本地 SQLite 或远程 D1）。 */
+export async function createImporterExecutor({ logger } = {}) {
+  const mod = await compileImporter();
+  return async (rows, opts) => mod.importLegacyPools(rows, { ...opts, logger });
+}
+
+/**
+ * 只读读取生产前置状态（双锁 wrangler）。不可用时降级为空对象 + 记录原因，
+ * 不阻断 plan/dry-run（守卫仍会对缺失状态给出 NOT_READY）。
+ */
+export async function readProdStateViaWrangler({
+  profile = 'jhzy',
+  accountId = GUARDS.EXPECTED_ACCOUNT_ID,
+  dbName = GUARDS.PROD_D1_NAME,
+  wranglerBin,
+} = {}) {
+  const bin = wranglerBin ?? resolveWranglerBin();
+  if (!bin) return { ok: false, reason: 'WRANGLER_NOT_FOUND' };
+  const sql = [
+    `SELECT COUNT(*) AS c0045 FROM d1_migrations WHERE name LIKE '%0045%'`,
+    `SELECT COUNT(*) AS c0046 FROM d1_migrations WHERE name LIKE '%0046%'`,
+    `SELECT COUNT(*) AS hasProvenanceColumn FROM pragma_table_info('id_pools') WHERE name='provenance'`,
+    `SELECT COUNT(*) AS syntheticCompatCount FROM id_pools WHERE provenance='v2_synthetic_compat'`,
+    `SELECT COUNT(*) AS legacyMigratedCount FROM id_pools WHERE provenance='legacy_migrated'`,
+    `SELECT COUNT(*) AS nullProvenanceCount FROM id_pools WHERE provenance IS NULL`,
+    `SELECT COUNT(*) AS duplicateCodeGroups FROM (SELECT code FROM id_pools GROUP BY code HAVING COUNT(*)>1)`,
+  ].join('; ');
+  try {
+    const out = execFileSync(
+      bin,
+      ['d1', 'execute', dbName, '--remote', '-e', 'production', '--profile', profile, '--json', '--command', sql],
+      {
+        // cwd 必须是 workers/（wrangler.toml 所在），否则 wrangler 找不到 --env production
+        cwd: join(__dirname, '..'),
+        env: { ...process.env, CLOUDFLARE_ACCOUNT_ID: accountId, CI: '1' },
+        encoding: 'utf8',
+        maxBuffer: 64 * 1024 * 1024,
+        // 继承 stdin：wrangler 以「是否交互」决定是否复用 --profile 的登录态。
+        // 若 stdin 被 pipe，wrangler 会强制要求 CLOUDFLARE_API_TOKEN 而失败。
+        stdio: ['inherit', 'pipe', 'pipe'],
+      },
+    );
+    const nums = [...out.matchAll(/"(c0045|c0046|hasProvenanceColumn|syntheticCompatCount|legacyMigratedCount|nullProvenanceCount|duplicateCodeGroups)":\s*(\d+)/g)];
+    const pick = (k) => {
+      const m = nums.find((x) => x[1] === k);
+      return m ? Number(m[2]) : undefined;
+    };
+    return {
+      ok: true,
+      migration0045Count: pick('c0045'),
+      migration0046Count: pick('c0046'),
+      hasProvenanceColumn: pick('hasProvenanceColumn') === 1,
+      syntheticCompatCount: pick('syntheticCompatCount'),
+      legacyMigratedCount: pick('legacyMigratedCount'),
+      nullProvenanceCount: pick('nullProvenanceCount'),
+      duplicateCodeGroups: pick('duplicateCodeGroups'),
+    };
+  } catch (e) {
+    // 诊断信息只取短摘要（不含任何 secret）；wrangler 在无 TTY 且无
+    // CLOUDFLARE_API_TOKEN 时会拒绝执行，此时降级为「前置状态不可用」，
+    // 由守卫按缺失状态给出 NOT_READY（fail-closed），不阻断 plan/dry-run。
+    const detail = String(e?.stderr ?? e?.message ?? e).slice(0, 200).replace(/\s+/g, ' ');
+    return { ok: false, reason: `WRANGLER_READ_FAILED: ${detail}` };
+  }
+}
+
+/**
+ * 解析 wrangler 可执行文件。
+ * 优先使用 PATH 上的 wrangler（已配置 --profile jhzy 的登录态）；
+ * 仅当 PATH 不可用时才回落到仓库本地 .bin（本地版本在非交互环境可能强制要求
+ * CLOUDFLARE_API_TOKEN，故不作为首选）。
+ */
+function resolveWranglerBin() {
+  try {
+    const p = execFileSync('which', ['wrangler'], { encoding: 'utf8' }).trim();
+    if (p && existsSync(p)) return p;
+  } catch { /* PATH 未命中，继续回落 */ }
+  const local = join(__dirname, '..', 'node_modules', '.bin', 'wrangler');
+  if (existsSync(local)) return local;
+  return null;
+}
+
+/**
+ * 构建 D1 适配器。
+ *  - dbMode='local'  → node:sqlite（本地模拟 / 测试，零网络）
+ *  - dbMode='remote' → Cloudflare D1 REST（生产写入；需 CLOUDFLARE_API_TOKEN）
+ *  - dbMode='none'   → 不建连接（plan / dry-run 默认）
+ */
+export async function createDbAdapter({ dbMode = 'none', localDbPath, accountId, dbUuid, dbName, apiToken }) {
+  if (dbMode === 'none') return null;
+  if (dbMode === 'local') return createLocalSqliteD1({ path: localDbPath ?? ':memory:', schema: ID_POOLS_SCHEMA });
+  if (dbMode === 'remote') {
+    if (dbUuid !== GUARDS.PROD_D1_UUID) throw new Error('REMOTE_TARGET_UUID_GUARD_FAILED');
+    if (accountId !== GUARDS.EXPECTED_ACCOUNT_ID) throw new Error('REMOTE_TARGET_ACCOUNT_GUARD_FAILED');
+    return createRemoteD1Adapter({ accountId, dbUuid, dbName, apiToken: apiToken ?? process.env.CLOUDFLARE_API_TOKEN });
+  }
+  throw new Error(`UNKNOWN_DB_MODE:${dbMode}`);
+}
+
 export function parseCliArgs(argv) {
-  const a = { mode: 'plan', target: {}, confirmations: {} };
+  const a = {
+    mode: 'plan',
+    target: {},
+    confirmations: {},
+    dbMode: 'none',
+    archivePath: DEFAULT_SOURCE_ARCHIVE,
+    workDir: undefined,
+    readProdState: false,
+  };
   for (let i = 0; i < argv.length; i++) {
     const k = argv[i];
     const next = () => argv[++i];
@@ -464,6 +606,12 @@ export function parseCliArgs(argv) {
       case '--target': a.target.dbName = next(); break;
       case '--account': a.target.accountId = next(); break;
       case '--db-uuid': a.target.dbUuid = next(); break;
+      case '--source-archive': a.archivePath = next(); break;
+      case '--work-dir': a.workDir = next(); break;
+      case '--db-mode': a.dbMode = next(); break;
+      case '--local-db-path': a.localDbPath = next(); break;
+      case '--batch-size': a.batchSize = Number(next()); break;
+      case '--read-prod-state': a.readProdState = true; break;
       case '--confirm-production-d1': a.confirmations.productionD1 = next(); break;
       case '--confirm-account': a.confirmations.account = next(); break;
       case '--confirm-source-sha': a.confirmations.sourceSha = next(); break;
@@ -475,15 +623,129 @@ export function parseCliArgs(argv) {
   return a;
 }
 
+/**
+ * 真实 CLI 主流程。
+ * plan / dry-run：必须真实读取并解析离线归档，产出 450,000 行统计；失败即非 0 退出。
+ * execute：仍需全部 --confirm-*，且必须显式 --db-mode。
+ */
+export async function runCli(argv, { logger = createSafeLogger(), executorOverride } = {}) {
+  const args = parseCliArgs(argv);
+  const target = {
+    accountId: args.target.accountId ?? GUARDS.EXPECTED_ACCOUNT_ID,
+    dbName: args.target.dbName ?? GUARDS.PROD_D1_NAME,
+    dbUuid: args.target.dbUuid ?? GUARDS.PROD_D1_UUID,
+  };
+  logger.info(`CERT-R5A-RUNNER mode=${args.mode} target=${target.dbName}/${target.dbUuid} dbMode=${args.dbMode}`);
+
+  // ---- 目标守卫 ----
+  const tgt = validateTarget(target);
+  if (!tgt.ok) {
+    logger.error('TARGET_GUARD', ...tgt.failures);
+    return { ok: false, exitCode: 2, stage: 'target', failures: tgt.failures };
+  }
+
+  // ---- 真实解析离线源（plan / dry-run / execute 都必须执行）----
+  let loaded;
+  try {
+    loaded = loadLegacySource({
+      archivePath: args.archivePath,
+      workDir: args.workDir ?? join(tmpdir(), 'cert-r5a-source'),
+      expectedSha256: GUARDS.EXPECTED_SOURCE_SHA256,
+    });
+  } catch (e) {
+    logger.error('SOURCE_LOAD_FAILED', String(e?.message ?? e));
+    return { ok: false, exitCode: 3, stage: 'source-load', failures: [String(e?.message ?? e)] };
+  }
+  const source = {
+    sha256: loaded.sha256,
+    rows: loaded.stats.rows,
+    poolCounts: loaded.stats.poolCounts,
+    statusCounts: loaded.stats.statusCounts,
+    assignedTo: loaded.stats.assignedTo,
+  };
+  logger.info(`SOURCE_PARSED ${formatStats(loaded.stats)}`);
+  if (loaded.stats.availableWithRef > 0) {
+    logger.warn(`SOURCE_ANOMALY availableWithAssignedToRef=${loaded.stats.availableWithRef}`);
+  }
+
+  const src = validateSource(source);
+  if (!src.ok) {
+    logger.error('SOURCE_GUARD', ...src.failures);
+    return { ok: false, exitCode: 4, stage: 'source', failures: src.failures };
+  }
+
+  // ---- 生产前置（可选，只读）----
+  let prod = {};
+  if (args.readProdState) {
+    const ps = await readProdStateViaWrangler({ profile: 'jhzy', accountId: target.accountId, dbName: target.dbName });
+    if (ps.ok) {
+      prod = ps;
+      logger.info(`PROD_STATE 0045=${ps.migration0045Count} 0046=${ps.migration0046Count} synthetic=${ps.syntheticCompatCount} legacy=${ps.legacyMigratedCount}`);
+    } else {
+      logger.warn(`PROD_STATE_UNAVAILABLE ${ps.reason}`);
+    }
+  }
+  const pre = validatePreconditions(prod);
+
+  // ---- plan / dry-run：不写 ----
+  if (args.mode === 'plan' || args.mode === 'dry-run') {
+    const plan = buildPlan({ target, source, precondition: pre, mode: args.mode });
+    logger.info(`MODE=${args.mode} PLAN_OK rows=${source.rows} precondition=${pre.reason} batches=${plan?.batches ?? 'n/a'}`);
+    if (args.mode === 'dry-run') {
+      logger.info(`DRY_RUN_BATCH_PLAN batchSize=${args.batchSize ?? 5000} batches=${Math.ceil(source.rows / (args.batchSize ?? 5000))} writes=0`);
+    }
+    return { ok: true, exitCode: 0, mode: args.mode, writes: false, plan, precondition: pre, stats: loaded.stats };
+  }
+
+  // ---- execute：完整确认 + 真实 executor ----
+  if (args.mode === 'execute') {
+    const c = args.confirmations ?? {};
+    const missing = [];
+    if (c.productionD1 !== GUARDS.PROD_D1_UUID) missing.push('confirm-production-d1');
+    if (c.account !== GUARDS.EXPECTED_ACCOUNT_ID) missing.push('confirm-account');
+    if (c.sourceSha !== GUARDS.EXPECTED_SOURCE_SHA256) missing.push('confirm-source-sha');
+    if (c.maintenanceWindow !== 'CERTIFICATE_ISSUANCE_CLOSED') missing.push('confirm-maintenance-window');
+    if (!c.iUnderstandProductionWrite) missing.push('confirm-i-understand-production-write');
+    if (args.dbMode === 'none') missing.push('--db-mode(local|remote)');
+    if (missing.length) {
+      logger.error('CONFIRMATION_GUARD', ...missing);
+      return { ok: false, exitCode: 5, stage: 'confirmation', failures: missing };
+    }
+    if (!pre.ok) {
+      logger.error('PRECONDITION_GUARD', ...pre.failures);
+      return { ok: false, exitCode: 6, stage: 'precondition', failures: pre.failures };
+    }
+    const db = await createDbAdapter({
+      dbMode: args.dbMode,
+      localDbPath: args.localDbPath,
+      accountId: target.accountId,
+      dbUuid: target.dbUuid,
+      dbName: target.dbName,
+    });
+    const executor = executorOverride ?? (await createImporterExecutor({ logger }));
+    const stats = await withRetry(
+      () => executor(loaded.rows, {
+        db,
+        batchSize: args.batchSize ?? 5000,
+        afterLegacyId: -1,
+        provenMappings: new Map(),
+        logger,
+      }),
+      { logger },
+    );
+    logger.info(`EXECUTE_OK inserted=${stats.inserted} alreadyPresent=${stats.alreadyPresent} conflicts=${stats.conflicts} batches=${stats.batches}`);
+    return { ok: true, exitCode: 0, mode: 'execute', writes: true, stats, precondition: pre };
+  }
+
+  logger.error('UNKNOWN_MODE', args.mode);
+  return { ok: false, exitCode: 7, stage: 'mode', failures: ['UNKNOWN_MODE'] };
+}
+
 // 仅在直接运行（node scripts/...mjs）时进入 CLI
 const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {
-  const args = parseCliArgs(process.argv.slice(2));
   const logger = createSafeLogger();
-  logger.info(`CERT-R5-RUNNER invoked mode=${args.mode} (no production write unless --mode execute with full confirmations)`);
-  // CLI 不直接连生产；仅打印守卫常量与模式说明，避免任何副作用。
-  logger.info(`EXPECTED_ACCOUNT=${GUARDS.EXPECTED_ACCOUNT_ID} PROD_D1=${GUARDS.PROD_D1_NAME}/${GUARDS.PROD_D1_UUID}`);
-  logger.info('This runner is guarded. Execute mode requires explicit --confirm-* flags and a maintenance window.');
-  process.exitCode = 0;
+  const r = await runCli(process.argv.slice(2), { logger });
+  process.exitCode = r.exitCode;
 }
 

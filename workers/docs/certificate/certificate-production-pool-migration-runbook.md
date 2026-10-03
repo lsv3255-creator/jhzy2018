@@ -266,30 +266,46 @@ wrangler versions rollback jhzy-v2-worker-production \
 
 ### 9.1 仅安全：plan / dry-run（不写生产）
 
+> ⚠ **旧版命令已废弃**（CERT-R5A）：R5 时期的 runner CLI 是「空转守卫桩」，
+> 只打印三行常量并 `exit 0`，**从未读取归档、从未解析 450,000 行、从未校验源统计**。
+> 其 `exit 0` 属伪通过。以下为 wiring 修复后的真实命令。
+
 ```bash
-# 双锁
+cd /Users/Shared/projects/jhzy-v2/workers
+
+# 双锁：profile + account（--read-prod-state 需要 TTY 或 CLOUDFLARE_API_TOKEN）
 export CLOUDFLARE_ACCOUNT_ID=8770e4917f904aed5df91c883cf058af
 
-# 只读预检（不写）：确认目标/源守卫 + 前置状态
+# 真实解析离线归档 450,000 行 + 校验 SHA/行数/pool/status/assigned_to + 生产前置（只读）
 node scripts/cert-r5-protected-legacy-pool-import-runner.mjs --mode plan \
-  --account 8770e4917f904aed5df91c883cf058af \
   --target jhzy-v2-prod \
-  --db-uuid d372229f-c0ae-4dcc-b968-4ec7c2832842
+  --account 8770e4917f904aed5df91c883cf058af \
+  --db-uuid d372229f-c0ae-4dcc-b968-4ec7c2832842 \
+  --read-prod-state
 
 node scripts/cert-r5-protected-legacy-pool-import-runner.mjs --mode dry-run \
-  --account 8770e4917f904aed5df91c883cf058af \
   --target jhzy-v2-prod \
-  --db-uuid d372229f-c0ae-4dcc-b968-4ec7c2832842
+  --account 8770e4917f904aed5df91c883cf058af \
+  --db-uuid d372229f-c0ae-4dcc-b968-4ec7c2832842 \
+  --read-prod-state
 ```
+
+预期输出含 `SOURCE_PARSED rows=450000 pools[…] status[…] assignedTo[null=939 sentinel=2 unresolved=747 proven_mappable=0]`。
+源缺失 / SHA 不匹配 / 行数不符 → **非 0 退出**。
 
 ### 9.2 生产写入（仅 R5 授权后，全确认齐全）
 
 ```bash
 # 前置：§2 已 apply 0045+0046 且 §2.2 schema 验证通过；§3 源档案 SHA 已校验。
+# 远程写入需 CLOUDFLARE_API_TOKEN（绝不写入文档 / 日志）。
+export CLOUDFLARE_API_TOKEN=...
+
 node scripts/cert-r5-protected-legacy-pool-import-runner.mjs --mode execute \
-  --account 8770e4917f904aed5df91c883cf058af \
   --target jhzy-v2-prod \
+  --account 8770e4917f904aed5df91c883cf058af \
   --db-uuid d372229f-c0ae-4dcc-b968-4ec7c2832842 \
+  --db-mode remote \
+  --read-prod-state \
   --confirm-production-d1 d372229f-c0ae-4dcc-b968-4ec7c2832842 \
   --confirm-account 8770e4917f904aed5df91c883cf058af \
   --confirm-source-sha d51563b0e3149535eb66ff64a3d447a5ad9dfa1cdf26f00b680b4824c4d688bf \
@@ -297,8 +313,19 @@ node scripts/cert-r5-protected-legacy-pool-import-runner.mjs --mode execute \
   --confirm-i-understand-production-write
 ```
 
-任何一项确认缺失、目标/源守卫不匹配、或 0045/0046 前置未就绪，Runner 都会 **fail-closed 不写**。
+任何一项确认缺失、未指定 `--db-mode`、目标/源守卫不匹配、或 0045/0046 前置未就绪，
+Runner 都会 **fail-closed 不写**，底层 `importLegacyPools` 根本不会被调用。
 日志永不输出 raw code / PII。
+
+本地演练（零网络、零生产副作用）：
+
+```bash
+node --experimental-sqlite scripts/cert-r5a-local-import-simulation.mjs
+```
+
+已实测：`inserted=450000 / conflicts=0 / id_pools_total=450500 / legacy_migrated=450000 /
+synthetic_compat=500 / null_provenance=0 / duplicate=0 / guessed_assigned_to=0`，
+pool 与 status 分布与 §6 对账目标逐项吻合。
 
 ---
 
