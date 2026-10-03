@@ -12,6 +12,7 @@
 
 import { BaseRepository, type RepoDeps } from './base';
 import { generateUlid } from '../utils/crypto';
+import { allocatableProvenanceSql } from '../domain/certificate';
 
 export interface CertificateTemplateRow {
   id: number;
@@ -258,10 +259,30 @@ export class CertificateRepository extends BaseRepository {
 
   // ===== id_pools（只读探测；消费在 exam 原子 batch 内完成）=====
 
+  /**
+   * TRAINING（cert_trn）候选编号探测 —— 【唯一权威的 cert_trn 选择点】。
+   *
+   * CERT-R3D-FIX §9/§10：候选必须同时满足
+   *   1) pool_type = 'cert_trn'
+   *   2) status = 0（free）
+   *   3) provenance ∈ ALLOCATABLE_PROVENANCES（= 'legacy_migrated' | 'v2_native'）
+   *
+   * 条件 3 是必需的：合成兼容库存（provenance='v2_synthetic_compat'）的 id 远小于
+   * legacy 行，仅按 (1)(2) 会让 TRAINING 先消费兼容库存，违反冻结决策
+   * NUMBER_FORMAT_POLICY = PRESERVE_LEGACY_FORMATS。
+   *
+   * 显式存储语义，不从 code 前缀/长度/正则推断（那正是本缺陷的成因）。
+   * `ORDER BY id ASC` 仅作为【合格集合内部】的确定性定序，不承担语义优先级。
+   *
+   * 消费侧（exam.ts 的条件 UPDATE）使用同一谓词片段，保证选择与烧号一致。
+   */
   async pickCertTrnCandidate(): Promise<string | null> {
     this.ensureTableRead('id_pools');
     const r = await this.first<{ code: string }>(
-      `SELECT code FROM id_pools WHERE pool_type = 'cert_trn' AND status = 0 ORDER BY id ASC LIMIT 1`,
+      `SELECT code FROM id_pools
+        WHERE pool_type = 'cert_trn' AND status = 0
+          AND ${allocatableProvenanceSql()}
+        ORDER BY id ASC LIMIT 1`,
       [],
     );
     return r?.code ?? null;

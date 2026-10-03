@@ -17,6 +17,7 @@
 import { BaseRepository, type RepoDeps } from './base';
 import { generateUlid } from '../utils/crypto';
 import { invalidParam, conflict, ConflictReason } from '../utils/errors';
+import { allocatableProvenanceSql } from '../domain/certificate';
 import type { D1PreparedStatement } from '@cloudflare/workers-types';
 
 const UNIQUE_VIOLATION_RE = /unique\s+constraint\s+failed/i;
@@ -626,7 +627,8 @@ export class ExamRepository extends BaseRepository {
       const gate = needIssue
         ? `AND (
              EXISTS (SELECT 1 FROM id_pools p
-                      WHERE p.pool_type = 'cert_trn' AND p.code = ? AND p.status = 0)
+                      WHERE p.pool_type = 'cert_trn' AND p.code = ? AND p.status = 0
+                      AND ${allocatableProvenanceSql('p')})
              OR EXISTS (SELECT 1 FROM certificates c
                          WHERE c.user_id = ? AND c.exam_paper_id = ? AND c.status = 1)
            )`
@@ -670,7 +672,8 @@ export class ExamRepository extends BaseRepository {
               WHERE id = ? AND user_id = ? AND team_id = ? AND status = 1
                 AND (
                   EXISTS (SELECT 1 FROM id_pools p
-                           WHERE p.pool_type = 'cert_trn' AND p.code = ? AND p.status = 0)
+                           WHERE p.pool_type = 'cert_trn' AND p.code = ? AND p.status = 0
+                      AND ${allocatableProvenanceSql('p')})
                   OR EXISTS (SELECT 1 FROM certificates c
                               WHERE c.user_id = ? AND c.exam_paper_id = ? AND c.status = 1)
                 )`,
@@ -693,7 +696,8 @@ const certType = args.faultCertType ?? 'training';
                 AND NOT EXISTS (SELECT 1 FROM certificates x
                                  WHERE x.user_id = ? AND x.exam_paper_id = ? AND x.status = 1)
                 AND EXISTS (SELECT 1 FROM id_pools p
-                             WHERE p.pool_type = 'cert_trn' AND p.code = ? AND p.status = 0)`,
+                             WHERE p.pool_type = 'cert_trn' AND p.code = ? AND p.status = 0
+                      AND ${allocatableProvenanceSql('p')})`,
           )
           .bind(args.certPublicId, args.certNoCandidate, args.verifyCode, args.templateId, certType, args.snapshotCert, args.now, args.now, args.sessionId, args.userId, args.teamId, args.userId, args.paperId, args.certNoCandidate),
       );
@@ -711,12 +715,15 @@ const certType = args.faultCertType ?? 'training';
       );
 
       // 5) 条件 id_pool consume（仅当本批 cert 已生成）
+      //    CERT-R3D-FIX §10：消费守卫与 pickCertTrnCandidate 使用【同一】provenance 谓词，
+      //    保证「选择」与「烧号」资格规则一致 —— 合成兼容库存永不被烧。
       statements.push(
         this.db
           .prepare(
             `UPDATE id_pools
                 SET status = 1, assigned_to = ?, assigned_at = ?
               WHERE pool_type = 'cert_trn' AND code = ? AND status = 0
+                AND ${allocatableProvenanceSql()}
                 AND EXISTS (SELECT 1 FROM certificates c WHERE c.public_id = ? AND c.status = 1)`,
           )
           .bind(args.userId, args.now, args.certNoCandidate, args.certPublicId),

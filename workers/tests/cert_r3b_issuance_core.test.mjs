@@ -129,6 +129,9 @@ CREATE TABLE id_pools (
   status      INTEGER NOT NULL DEFAULT 0 CHECK (status IN (0,1,2)),
   assigned_to INTEGER,
   assigned_at INTEGER,
+  -- CERT-R3D-FIX：分配资格要求显式 provenance（0046 起存在；fail-closed 白名单）
+  provenance  TEXT CHECK (provenance IS NULL OR provenance IN
+                ('legacy_migrated','v2_synthetic_compat','v2_native')),
   created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
   UNIQUE (pool_type, code)
 );
@@ -302,7 +305,7 @@ const baseReq = (o) => ({
 // 播种 cert_srv（测试夹具内的合成播种，模拟「未来种子迁移」；非生产行为）
 // 数量足以覆盖 A–F，随后由 M 用例专门耗尽以验证确定性失败。
 db.exec(`WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x<8)
-INSERT INTO id_pools (pool_type, code, status, created_at) SELECT 'cert_srv', printf('CSRV%06d', x), 0, unixepoch() FROM seq;`);
+INSERT INTO id_pools (pool_type, code, status, provenance, created_at) SELECT 'cert_srv', printf('CSRV%06d', x), 0, 'legacy_migrated', unixepoch() FROM seq;`);
 
 // A. ACTIVITY 首次发放成功
 let act1;
@@ -439,7 +442,7 @@ let srv1;
 // 由于审计与证书 INSERT 在同一 D1 batch，整批回滚 → 既不报 ISSUED，也不留孤儿证书。
 {
   db.exec(`WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x<2)
-INSERT INTO id_pools (pool_type, code, status, created_at) SELECT 'cert_srv', printf('CSRV9%05d', x), 0, unixepoch() FROM seq;`);
+INSERT INTO id_pools (pool_type, code, status, provenance, created_at) SELECT 'cert_srv', printf('CSRV9%05d', x), 0, 'legacy_migrated', unixepoch() FROM seq;`);
   const before = db.prepare('SELECT COUNT(*) n FROM certificates').get().n;
   db.exec('ALTER TABLE certificate_logs RENAME TO certificate_logs_bak;');
   db.exec(`CREATE TABLE certificate_logs (
@@ -519,7 +522,7 @@ INSERT INTO id_pools (pool_type, code, status, created_at) SELECT 'cert_srv', pr
 
 // §1 政策明确放行 → 可正常发放
 {
-  db.exec(`INSERT INTO id_pools (pool_type, code, status, created_at) VALUES ('cert_srv','CSRV-FC01',0,unixepoch());`);
+  db.exec(`INSERT INTO id_pools (pool_type, code, status, provenance, created_at) VALUES ('cert_srv','CSRV-FC01',0,'legacy_migrated',unixepoch());`);
   const s = new CertificateIssuanceService({ repo, eligibility: ALLOW_ELIGIBILITY, recipientGuard: GUARD_ALLOW });
   const r = await s.issue(baseReq({ recipientUserId: 30, sourceId: 20 }));
   check('§1 policy 显式 eligible → 允许发放', r.outcome === 'ISSUED', r.outcome);
@@ -553,7 +556,7 @@ INSERT INTO id_pools (pool_type, code, status, created_at) SELECT 'cert_srv', pr
 
 // §2 守卫放行 → 允许；守卫拒绝 → 拒绝
 {
-  db.exec(`INSERT INTO id_pools (pool_type, code, status, created_at) VALUES ('cert_srv','CSRV-FC02',0,unixepoch());`);
+  db.exec(`INSERT INTO id_pools (pool_type, code, status, provenance, created_at) VALUES ('cert_srv','CSRV-FC02',0,'legacy_migrated',unixepoch());`);
   const before1676 = db.prepare('SELECT COUNT(*) n FROM certificates WHERE user_id=1676').get().n;
   const s = new CertificateIssuanceService({ repo, eligibility: ALLOW_ELIGIBILITY, recipientGuard: GUARD_DENY_SYS });
   const r = await s.issue(baseReq({ recipientUserId: 1676, sourceId: 22 }));
@@ -594,7 +597,7 @@ INSERT INTO id_pools (pool_type, code, status, created_at) SELECT 'cert_srv', pr
   //       （allocator 只会挑 status=0，故后到者得到 POOL_UNAVAILABLE/EXHAUSTED），
   //       绝不会出现「X 被两张证书共用」。
   db.exec(`DELETE FROM id_pools WHERE pool_type='cert_srv';`);
-  db.exec(`INSERT INTO id_pools (pool_type, code, status, created_at) VALUES ('cert_srv','CSRV-RACE-X',0,unixepoch());`);
+  db.exec(`INSERT INTO id_pools (pool_type, code, status, provenance, created_at) VALUES ('cert_srv','CSRV-RACE-X',0,'legacy_migrated',unixepoch());`);
 
   const s = new CertificateIssuanceService({ repo, eligibility: ALLOW_ELIGIBILITY, recipientGuard: GUARD_ALLOW });
   const a = await s.issue(baseReq({ recipientUserId: 40, sourceId: 30 }));
@@ -613,7 +616,7 @@ INSERT INTO id_pools (pool_type, code, status, created_at) SELECT 'cert_srv', pr
 {
   // 直接对仓储发起同号分配：两条语句用同一 code，仅有一条能 changes=1
   db.exec(`DELETE FROM id_pools WHERE pool_type='cert_srv';`);
-  db.exec(`INSERT INTO id_pools (pool_type, code, status, created_at) VALUES ('cert_srv','CSRV-DUP',0,unixepoch());`);
+  db.exec(`INSERT INTO id_pools (pool_type, code, status, provenance, created_at) VALUES ('cert_srv','CSRV-DUP',0,'legacy_migrated',unixepoch());`);
   // user 42 / activity 42 可能已由 M 用例的预填充创建 → 用 INSERT OR IGNORE 幂等补齐
   db.exec(`INSERT OR IGNORE INTO users (id, public_id, status) VALUES (42,'01USER42',1);`);
   db.exec(`INSERT OR IGNORE INTO activities (id, team_id, title) VALUES (42, 1, 'act-42');`);

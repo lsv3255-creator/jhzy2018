@@ -27,6 +27,7 @@ import { BaseRepository, type RepoDeps } from './base';
 import {
   CertificateKind,
   CertificateSource,
+  allocatableProvenanceSql,
   type IssueSource,
   type PersistedSourceType,
 } from '../domain/certificate';
@@ -57,16 +58,24 @@ export class CertificateIssuanceRepository extends BaseRepository {
   // ===== 号池（id_pools，PLATFORM_GLOBAL）=====
 
   /**
-   * 只读探测：取该池首个空闲编号（status=0）。
-   * 与既有 CertificateRepository.pickCertTrnCandidate 同模式（ORDER BY id ASC LIMIT 1），
-   * 保证「先到先得」与既有 cert_trn 行为一致。
+   * 只读探测：取该池首个【可分配】空闲编号（status=0 且 provenance 合规）。
    *
+   * CERT-R3D-FIX §9：候选必须额外满足
+   *   `provenance ∈ ALLOCATABLE_PROVENANCES`（'legacy_migrated' | 'v2_native'）
+   * 从而确定性排除合成兼容库存（'v2_synthetic_compat'）与任何未分类/NULL 来源
+   * （fail-closed：白名单谓词天然不命中未知值）。
+   * 与 CertificateRepository.pickCertTrnCandidate 共用同一资格规则片段。
+   *
+   * `ORDER BY id ASC` 仅在【合格集合内部】提供确定性定序，不承担语义优先级。
    * 注意：探测与消费分离；真正的消费在 issueBatch 内以条件 UPDATE 完成。
    */
   async peekPoolCode(poolType: string): Promise<string | null> {
     this.ensureTableRead('id_pools');
     const row = await this.first<{ code: string }>(
-      `SELECT code FROM id_pools WHERE pool_type = ? AND status = 0 ORDER BY id ASC LIMIT 1`,
+      `SELECT code FROM id_pools
+        WHERE pool_type = ? AND status = 0
+          AND ${allocatableProvenanceSql()}
+        ORDER BY id ASC LIMIT 1`,
       [poolType],
     );
     return row?.code ?? null;
@@ -90,8 +99,12 @@ export class CertificateIssuanceRepository extends BaseRepository {
    *
    * 守卫链（缺一不可）：
    *   1. pool_type + code + status=0 → 候选必须仍未被抢占；
+   *   1b. provenance ∈ ALLOCATABLE_PROVENANCES → 【与 peekPoolCode 同一谓词】
+   *       CERT-R3D-FIX §10：选择与消费必须使用完全相同的资格规则，
+   *       否则会出现「选时合法、烧时按另一套规则」的不一致，
+   *       并可能烧掉合成兼容库存。
    *   2. EXISTS(certificates public_id=?) → 本批证书已真实生成才允许烧号。
-   * 第 2 条是「证书失败不烧号」的唯一保证，与 exam.ts:716-722 完全同构。
+   * 第 2 条是「证书失败不烧号」的唯一保证，与 exam.ts 的消费守卫完全同构。
    */
   buildPoolConsumeStatement(args: {
     poolType: string;
@@ -104,6 +117,7 @@ export class CertificateIssuanceRepository extends BaseRepository {
       sql: `UPDATE id_pools
                SET status = 1, assigned_to = ?, assigned_at = ?
              WHERE pool_type = ? AND code = ? AND status = 0
+               AND ${allocatableProvenanceSql()}
                AND EXISTS (SELECT 1 FROM certificates c
                             WHERE c.public_id = ? AND c.status = 1)`,
       params: [args.assignedTo, args.now, args.poolType, args.code, args.issuedCertPublicId],

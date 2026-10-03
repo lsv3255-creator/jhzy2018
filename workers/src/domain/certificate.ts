@@ -264,6 +264,58 @@ export interface CertificateBatchSummary {
   skipped: number;
 }
 
+// ===== 号池库存来源（provenance）与可分配性（CERT-R3D-FIX §4/§5）=====
+//
+// 问题背景：V2 现有 500 条合成 cert_trn（CTRN%06d，0022 播种）的 id 为 1..500，
+// 而导入的 180,000 条 legacy cert_trn 的 id 远大于此。若分配器仅按
+// `pool_type + status=0 + ORDER BY id ASC` 取号，TRAINING 会先消费合成号 ——
+// 违反冻结决策 NUMBERING_POLICY = PRESERVE_LEGACY_FORMATS
+// （历史库存为权威continuing inventory，合成池仅为兼容库存）。
+//
+// 修法【不使用任何格式推断】：不改 legacy 行 id、不删除合成行、不伪造 status、
+// 不用 CTRN/JHCRT 前缀或长度或正则判别。改为在 id_pools 上存【显式来源语义】，
+// 分配器要求 provenance ∈ ALLOCATABLE_PROVENANCES。
+//
+// ⚠ 明确禁止把 provenance 做成「可从 code 推断」的派生值 —— 必须是存储语义。
+export type PoolProvenance =
+  /** legacy `id_pool` 450,000 行历史库存（权威continuing inventory，可分配）。 */
+  | 'legacy_migrated'
+  /** V2 0022 播种的 500 条 CTRN 合成兼容库存（保留但**不可**被正常分配）。 */
+  | 'v2_synthetic_compat'
+  /** 未来经显式批准的 V2 原生库存（可分配；本轮不生成任何此类编号）。 */
+  | 'v2_native';
+
+/**
+ * 可参与正常分配的来源白名单（fail-closed）。
+ *
+ * FAIL-CLOSED 语义（§5）：
+ *   - 白名单外的 provenance（含 `v2_synthetic_compat`）**一律不作为候选**；
+ *   - provenance 为 NULL 或未来出现的未知字面量同样**不作为候选**
+ *     （SQL 用 `IN (...)` 谓词，未知值天然不命中 → 无「NULL 即允许」路径）。
+ * 因此「未分类 / 未知」永远是安全侧，不需要额外的 allocatable 布尔列
+ * （避免冗余列与二者在未来漂移不一致）。
+ */
+export const ALLOCATABLE_PROVENANCES: readonly PoolProvenance[] = Object.freeze([
+  'legacy_migrated',
+  'v2_native',
+]);
+
+/** 合成兼容库存的 provenance 值（保留、不可分配）。 */
+export const SYNTHETIC_COMPAT_PROVENANCE: PoolProvenance = 'v2_synthetic_compat';
+
+/**
+ * 生成「可分配」SQL 片段（供 SELECT 候选与条件 UPDATE 消费共用）。
+ *
+ * 复用同一片段可保证**选择**与**消费**使用完全相同的资格规则 —— 避免
+ * 「选的时候合法、烧的时候按另一套规则」这类不一致（§10）。
+ * 列名默认 `provenance`；带表别名时传 alias（如 `p` → `p.provenance`）。
+ */
+export function allocatableProvenanceSql(alias?: string): string {
+  const col = alias ? `${alias}.provenance` : 'provenance';
+  const list = ALLOCATABLE_PROVENANCES.map((p) => `'${p}'`).join(', ');
+  return `${col} IN (${list})`;
+}
+
 // ===== Number allocator contract（§11 / §H；CERT-R2 仅接口/契约）=====
 //
 // ACTIVITY/SERVICE POOL STRATEGY = candidate reuse of cert_srv
@@ -271,13 +323,15 @@ export interface CertificateBatchSummary {
 //   —— 'cert_srv' 保留 V1.0 服务证书语义且在 CHECK 内 → 可作候选池，零迁移、零表重建。
 //   —— 不新建 'cert_act'（违反 CHECK；扩展需重建 id_pools 表，违背 ADDITIVE）。
 //
-// EXTERNAL NUMBER FORMAT = DEFERRED_TO_CERT_R3B
-//   理由：① V2 唯一运行格式为 CTRN%06d（0022 播种）；② V1.0 的 JHCRT-* 未在 V2 落地，
-//   且历史上已产生 cert_no 碰撞；③ 无权威既有 V2 规则可循。
-//   → 先定池（cert_srv 候选），后定格式（CERT-R3B 分配器实现决策）。
-//   本轮【不播种 cert_srv、不改 id_pools、不臆造对外编号】。
+// EXTERNAL NUMBER FORMAT = DEFERRED_PENDING_CERT_R3C
+//   CERT-R3D 已确定：TRAINING/ACTIVITY/SERVICE 均改为消费【legacy 历史库存】
+//   （JHCRT-*/JH-* 字面量），故「对外格式」事实上由历史 code 形态承载；
+//   但「是否需要额外前缀包装」仍留待 CERT-R3C 裁决。
 //
-// 现状：training 发放仍使用既有 cert_trn 池（CTRN%06d），本轮完全不变。
+// 历史编号政策（人类授权冻结，CERT-R3C）：
+//   LEGACY_POOL_ASSET_POLICY = PRESERVE_AND_CONTINUE
+//   NUMBER_FORMAT_POLICY     = PRESERVE_LEGACY_FORMATS
+//   NEW_NUMBER_GENERATION    = FORBIDDEN
 export type CertNumberPoolType = 'cert_trn' | 'cert_srv' | 'cert_hon';
 
 export interface CertificateNumberAllocator {

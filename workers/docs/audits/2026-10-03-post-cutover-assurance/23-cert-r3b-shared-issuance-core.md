@@ -37,6 +37,14 @@
 **编号选定**：`peekPoolCode()` = 只读 `SELECT code FROM id_pools WHERE pool_type=?
 AND status=0 ORDER BY id ASC LIMIT 1`（事务外，**不立即消费**）。
 
+> **CERT-R3D-FIX 增补（分配资格）**：候选谓词在 `pool_type + status=0` 之外
+> 新增 `provenance IN ('legacy_migrated','v2_native')`（fail-closed 白名单，
+> 经 `allocatableProvenanceSql()` 生成）。合成兼容库存
+> （`v2_synthetic_compat`）保留但**不可分配**；NULL/未知同样不可分配。
+> `ORDER BY id ASC` 仅在合格集合内部定序。详见
+> `docs/certificate/legacy-id-pool-migration.md` §2.1。
+
+
 **`db.batch` 语句顺序（3 条）**：
 
 | 序 | 语句 | 守卫 |
