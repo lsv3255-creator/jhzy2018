@@ -414,3 +414,33 @@ HTTP 路由 / 批量 / PDF / R2 / 公开验真修复 / 前端 / 考试迁移 / �
 本文档仅记录聚合计数、哈希与格式模式。**未**包含：真实编号字符串、接收者 ID、
 姓名、手机号、OpenID、身份证、生产连接串。历史格式以模式呈现
 （`JHCRT-{TRN|SRV|HON|SKL}-<8>-<5>` / `JH-<8>-<5>` / `CTRN%06d`）。
+
+---
+
+## 17. STAGING 实际执行证据（CERT-R3E，2026-10-03）
+
+> 完整报告：`docs/audits/2026-10-03-post-cutover-assurance/26-cert-r3e-staging-legacy-pool-migration.md`
+> 目标：`jhzy-v2-staging` / `85853fb1-1384-486e-9be3-566f72f45c5d`（仅 staging）
+
+§2.1.7 的部署顺序约束已按序执行并全部通过：
+
+| 步骤 | 结果 |
+| --- | --- |
+| 1. 进入受控发证窗口 | `STAGING_CERTIFICATE_ISSUANCE_WINDOW = CLOSED` |
+| 2. 应用 0045 | ✅ 0045 ×1；证书 413 → 413（零改动） |
+| 3. 应用 0046 | ✅ 0046 ×1；合成 500 分类为 `v2_synthetic_compat`，可分配 = 0 |
+| 4. 导入 450,000 行 | ✅ 冲突 0；中途多次网络中断，按断点续跑完成 |
+| 5. 校验计数/哈希/provenance | ✅ 450,500；逐池/逐状态精确；指纹 5/5 + 状态 5/5 |
+| 6. 验证 TRAINING / ACTIVITY / SERVICE 候选 | ✅ 179,543 / 149,692 / 149,692，**均来自 legacy，合成 0** |
+| 7. 恢复发证窗口 | `OPEN`（仅表示 DB 就绪；本Gate 未发证、未部署） |
+
+**最终状态**：`id_pools` = 450,500（legacy_migrated 450,000 + v2_synthetic_compat 500，
+provenance NULL = 0）；status 0/1/2 = 448,812 / 1,661 / 27；
+全局重复 code = 0；FK 违规 = 0；证书 413 未变；幂等复跑新增 0。
+
+**执行中发现的平台约束（供后续 Gate 复用）**：
+1. `wrangler.jsonc` 默认 binding 是被禁止的 `jhzy-v2-db`，每条命令必须显式 `-e staging`；
+2. D1 单语句体积上限约 80KB（超限 `SQLITE_TOOBIG`）；macOS argv 单串上限 256KB（超限 `E2BIG`）；
+3. D1 `SQLITE_MAX_COMPOUND_SELECT` 极小（实测 100 项 `UNION ALL` 即失败）；
+4. 可行形态：`INSERT OR IGNORE … VALUES (…),(…)…`，按 ≤60KB 字节预算切块，
+   幂等由 `UNIQUE(code)` 保证，单块远端耗时约 4–7 秒。
