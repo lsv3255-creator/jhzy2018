@@ -58,7 +58,21 @@ export enum CertificateSource {
   COURSE = 'course',
   ACTIVITY = 'activity',
   MANUAL = 'manual',
-  SERVICE = 'activity', // 生产现实：service 复用 source_type='activity'
+  /**
+   * ⚠ CERT-R3B 修正：SERVICE 曾被赋值为 'activity'（与 ACTIVITY 相同），这使
+   * 「域概念」在运行时【无法区分】——`Array.find(m => m.domain === domain)`
+   * 对 SERVICE 永远命中 ACTIVITY 条目，导致 issue_source 被错误派生为 'activity'
+   *   （已由 CERT-R3B 测试 C/E 实际暴露）。
+   *
+   * 域层需要**可区分的独立标识**（issue_source 正是为此存在），故：
+   *   - 域枚举值改为可区分的 'service'；
+   *   - 持久化 source_type 仍为 'activity'（由 DOMAIN_TO_PERSISTED_SOURCE 映射，
+   *     既有 413 行与 uq_cert_user_source 谓词均不受影响）。
+   * 兼容性：DOMAIN_TO_PERSISTED_SOURCE 提供到持久化值的显式映射，
+   * 故任何以 `domain` 做键的调用点都必须改用 `persistedSourceFor(domain)`，
+   * 直接把枚举当 source_type 用的旧写法不存在（grep 已核）。
+   */
+  SERVICE = 'service',
 }
 
 /**
