@@ -287,7 +287,38 @@ node scripts/cert-r5-protected-legacy-pool-import-runner.mjs --mode execute \
 
 ---
 
-## 10. HARD STOP
+## 10. R5 Authorization Phrase & Final Human Gate
+
+> 依据：`29-cert-r5-production-authorization-review.md`（CERT-R5-AUTH，2026-10-03）
+> STATUS = **AUTHORIZATION REVIEW ONLY**
+> PRODUCTION EXECUTION = **NOT AUTHORIZED**（尚未收到显式授权短语）
+
+### 10.1 授权短语（显式、无歧义）
+
+仅当管理员原样提供以下短语（或实质等同的明确授权）方可执行 R5：
+
+> 我明确授权执行 CERT-R5 生产证书号池迁移：允许在维护窗口内对 jhzy-v2-prod
+> 应用 0045/0046、导入 450000 legacy id_pools、使用受保护 runner 执行生产写入，
+> 并按 runbook 部署 production Worker 与完成验收。
+
+以下**不视为**授权：“继续” / “开始” / “执行下一步” / 任何模糊指令。
+
+### 10.2 授权前人工确认清单（摘要）
+
+- [ ] 维护窗口精确时间（CST）已分配
+- [ ] 负责操作员 / 沟通负责人已指定
+- [ ] 写入前证书签发已关闭（CLOSED_FOR_WRITES）
+- [ ] 窗口内无管理员/批量签发、无公开可用性声明
+- [ ] 回滚沟通预案已备
+- [ ] HTTP E2E 环境可达（当前 UNKNOWN → 须执行前确认）
+- [ ] 收到 §10.1 显式授权短语
+
+### 10.3 最终人工闸门
+
+未同时满足 §10.2 全部项 + §10.1 显式短语 → 不得执行本 Runbook 任何写入步骤。
+R5 命令包（P0–P15）见 `29-cert-r5-production-authorization-review.md` §10，全部为 TEMPLATE ONLY。
+
+## 11. HARD STOP
 
 ```
 STATUS = PLANNING ONLY
