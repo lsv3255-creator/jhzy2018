@@ -1,0 +1,14 @@
+{
+  "marker": "T1_TEST_DO_NOT_USE_REAL",
+  "certificate_id": 990009,
+  "certificate_public_id": "CYDSBABK8ABXXEYAAR4A7EQWWP",
+  "verify_code": "8TRCZ0YCYHMMM1YNXJXP192ATN",
+  "cert_no_masked": "JHCR****FT3J",
+  "pool_id": 25775,
+  "recipient_user_id": 990001,
+  "team_id": 990002,
+  "source_activity_id": 990003,
+  "template_id": 990008,
+  "issued_at": 1791116463,
+  "issue_path": "D1_FALLBACK"
+}

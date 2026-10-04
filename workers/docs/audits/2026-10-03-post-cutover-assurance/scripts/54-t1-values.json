@@ -1,0 +1,26 @@
+{
+  "marker": "T1_TEST_DO_NOT_USE_REAL",
+  "sentinel_ids": {
+    "user": 990001,
+    "team": 990002,
+    "activity": 990003,
+    "occurrence": 990004,
+    "signup": 990005,
+    "participation": 990006,
+    "attendance": 990007,
+    "template": 990008,
+    "certificate": 990009
+  },
+  "ulids": {
+    "user_public_id": "ZZVDTWK1AXYKBF8RPHAGW2ZZA2",
+    "team_public_id": "HC37MNTA21CJTCH5FHHEPCNPZ7",
+    "activity_public_id": "G92NH9A4VX5WATWAFZABQBJ1VH",
+    "occurrence_public_id": "AQ5NXG7YTGVW0JYYAAK683WS80",
+    "participation_public_id": "VZ9X5S5JZ2CXXH6FS4PGM4KTP2"
+  },
+  "timestamps": {
+    "now": 1791116136,
+    "checkin_at": 1791108936,
+    "checkout_at": 1791112536
+  }
+}
