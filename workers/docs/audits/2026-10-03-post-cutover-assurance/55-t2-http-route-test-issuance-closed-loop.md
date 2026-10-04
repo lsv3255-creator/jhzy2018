@@ -179,7 +179,7 @@ FINAL_CERTIFICATE_STATUS = 2 (REVOKED, retained)
 PRODUCTION_D1_MUTATED = YES_TEST_ONLY
 REAL_BUSINESS_CERTIFICATE_ISSUED = NO
 GIT_PUSH_PERFORMED = NO
-DOC_COMMIT_SHA = <见 git 提交后回填>
+DOC_COMMIT_SHA = 8ce9c43836989a465846a578d3441d580cad36fd
 SECRET_PII_SCAN = PASS (无 full token/手机号/OpenID/身份证/真实姓名/raw cert_no/raw pool code)
 NEXT_ACTION = 建独立 TEST 清理工具（按 T2_TEST_DO_NOT_USE_REAL 标记 + 哨兵 id 991001..991020 批量定位、撤销/归档）；并评估是否新增 cert_srv 号池安全回退接口以便回收本次消耗的 1 个 legacy 编号
 ```
