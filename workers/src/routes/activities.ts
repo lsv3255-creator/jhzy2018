@@ -33,10 +33,24 @@ import { ActivityAdminService } from '../services/activity-admin-service';
 import { ActivityAttendanceService } from '../services/attendance-service';
 import { requirePermission } from '../middleware/rbac';
 import { D1PermissionProvider, can } from '../services/permission-provider';
-import { ok } from '../utils/response';
-import { authRequired, invalidParam, AppError, ErrorCode } from '../utils/errors';
+import { ok, fail } from '../utils/response';
+import {
+  authRequired,
+  invalidParam,
+  AppError,
+  ErrorCode,
+  ErrorCodeValue,
+  forbidden,
+  teamScopeRequired,
+  notFound,
+} from '../utils/errors';
 import { requireUlidParam, parsePagination, isUlid } from '../utils/validation';
 import { parseAttendanceLocation, type AttendanceLocation } from '../utils/location';
+import { buildCertificateIssuanceService, parseSystemUserIds } from '../services/certificate-issuance-factory';
+import { CertificateSource, CertificateKind } from '../domain/certificate';
+import { ParticipationRepository } from '../repository/participation';
+import { CertificateBatchRepository } from '../repository/certificate-batches';
+import { generateUlid } from '../utils/crypto';
 
 const activities = new Hono<{ Bindings: Env; Variables: AppVars }>();
 
@@ -51,6 +65,37 @@ function assertNoForbiddenPublicationFields(body: Record<string, unknown>): void
       throw invalidParam(field, 'publication/approval fields are server-authoritative and must not be supplied');
     }
   }
+}
+
+/**
+ * POST-R5-P5：把 CertificateIssuanceService 的确定性业务结果（outcome）映射到
+ * 统一失败信封（与全仓 ApiFailure 形态一致，不泄露内部信息）。
+ *
+ * 映射纪律：
+ *   - NOT_ELIGIBLE → 422（业务资格未达成，非客户端参数错误）
+ *   - RECIPIENT_NOT_FOUND / SOURCE_NOT_FOUND → 404（资源不存在 / 不可见，统一不区分）
+ *   - SOURCE_ID_REQUIRED / UNSUPPORTED_SOURCE / INVALID_REQUEST → 400
+ *   - NUMBER_POOL_*（池不可用/耗尽）→ 409（资源状态冲突）
+ *   - 其余（守卫/审计/插入失败）→ 500（内部错误，不泄露 SQL）
+ */
+function issuanceFailure(c: import('hono').Context, outcome: string): Response {
+  const map: Record<string, { status: number; code: ErrorCodeValue }> = {
+    NOT_ELIGIBLE: { status: 422, code: ErrorCode.VALIDATION_FAILED },
+    RECIPIENT_NOT_FOUND: { status: 404, code: ErrorCode.NOT_FOUND },
+    SOURCE_NOT_FOUND: { status: 404, code: ErrorCode.NOT_FOUND },
+    SOURCE_ID_REQUIRED: { status: 400, code: ErrorCode.INVALID_PARAM },
+    UNSUPPORTED_SOURCE: { status: 400, code: ErrorCode.INVALID_PARAM },
+    INVALID_REQUEST: { status: 400, code: ErrorCode.INVALID_PARAM },
+    ELIGIBILITY_POLICY_UNAVAILABLE: { status: 500, code: ErrorCode.INTERNAL_ERROR },
+    RECIPIENT_GUARD_UNAVAILABLE: { status: 500, code: ErrorCode.INTERNAL_ERROR },
+    CERTIFICATE_INSERT_FAILED: { status: 500, code: ErrorCode.INTERNAL_ERROR },
+    AUDIT_FAILED: { status: 500, code: ErrorCode.INTERNAL_ERROR },
+    NUMBER_POOL_UNAVAILABLE: { status: 409, code: ErrorCode.CONFLICT },
+    NUMBER_POOL_EXHAUSTED: { status: 409, code: ErrorCode.CONFLICT },
+    NUMBER_ALLOCATION_FAILED: { status: 500, code: ErrorCode.INTERNAL_ERROR },
+  };
+  const hit = map[outcome] ?? { status: 500, code: ErrorCode.INTERNAL_ERROR };
+  return fail(c, new AppError(hit.code, hit.status, `certificate issuance failed: ${outcome}`));
 }
 
 /**
@@ -464,5 +509,233 @@ activities.post('/:id/reject', requirePermission('activity.activity.review'), as
   const view = await svc.reject(publicId, reason);
   return ok(c, { activity: view });
 });
+
+// =========================================================================
+// POST-R5-P5：活动证书发放接线（ACTIVITY source）
+//
+// 权限：certificate.certificate.issue（D1PermissionProvider 裁决；未认证 401 / 无授权 403）。
+// 真实路由前缀（项目无 /admin/ 前缀）：/api/v2/activities/...
+//   设计文档 37 的 /api/v2/admin/activities/... 形态为 aspirational，
+//   本任务按项目实际路由风格接线（偏差说明见 doc 39）。
+//
+// 纪律：
+//   - teamId 必填（certificates / certificate_logs 为 TEAM_SCOPED；平台角色 teamId=null
+//     会在 repo 层 ensureTableRead 抛 teamScopeRequired，故端到端发证须用团队角色上下文）。
+//   - 本人自发证（operatorUserId === recipientUserId）→ 403 SELF_ISSUE_FORBIDDEN（独立于 RecipientGuard）。
+//   - 批量 issue 创建 certificate_batches 账本行（可观测性），逐接收者仍走
+//     CertificateIssuanceService.issue 单一原语（BATCH_BOUNDARY 冻结契约）。
+// =========================================================================
+
+/** POST /api/v2/activities/:activityId/certificates/preview —— 活动证书资格预览（批量）。 */
+activities.post(
+  '/:activityId/certificates/preview',
+  requirePermission('certificate.certificate.issue'),
+  async (c) => {
+    const auth = c.get('auth');
+    const tenant = c.get('tenant');
+    if (!auth.authenticated) throw authRequired();
+    if (auth.userId == null) throw authRequired();
+    if (tenant.teamId == null) throw teamScopeRequired();
+
+    const activityPublicId = requireUlidParam(c.req.param('activityId'), 'activityId');
+    const partRepo = new ParticipationRepository({ db: c.env.DB, ctx: { auth, tenant } });
+    const activity = await partRepo.resolveActivity(activityPublicId, tenant.teamId);
+    if (activity == null) throw notFound('activity');
+
+    let body: Record<string, unknown> = {};
+    try {
+      const json = await c.req.json();
+      if (json != null && typeof json === 'object' && !Array.isArray(json)) body = json as Record<string, unknown>;
+    } catch {
+      throw invalidParam('request', 'invalid request body');
+    }
+    const templateId = Number(body.templateId);
+    if (!Number.isInteger(templateId) || templateId <= 0) throw invalidParam('templateId', 'must be a positive integer');
+    const recipientUserIds = Array.isArray(body.recipientUserIds)
+      ? (body.recipientUserIds as unknown[]).map((x) => Number(x)).filter((n) => Number.isInteger(n) && n > 0)
+      : [];
+
+    const svc = buildCertificateIssuanceService(c.env.DB, { auth, tenant }, parseSystemUserIds(c.env));
+    const results = [];
+    for (const uid of recipientUserIds) {
+      const r = await svc.previewEligibility({
+        recipientUserId: uid,
+        teamId: tenant.teamId,
+        domainSource: CertificateSource.ACTIVITY,
+        sourceId: activity.id,
+      });
+      results.push({ userId: uid, ...r });
+    }
+    return ok(c, { activityId: activityPublicId, templateId, results });
+  },
+);
+
+/** POST /api/v2/activities/:activityId/certificates/issue —— 活动证书批量发放。 */
+activities.post(
+  '/:activityId/certificates/issue',
+  requirePermission('certificate.certificate.issue'),
+  async (c) => {
+    const auth = c.get('auth');
+    const tenant = c.get('tenant');
+    if (!auth.authenticated) throw authRequired();
+    if (auth.userId == null) throw authRequired();
+    if (tenant.teamId == null) throw teamScopeRequired();
+
+    const activityPublicId = requireUlidParam(c.req.param('activityId'), 'activityId');
+    const partRepo = new ParticipationRepository({ db: c.env.DB, ctx: { auth, tenant } });
+    const activity = await partRepo.resolveActivity(activityPublicId, tenant.teamId);
+    if (activity == null) throw notFound('activity');
+
+    let body: Record<string, unknown> = {};
+    try {
+      const json = await c.req.json();
+      if (json != null && typeof json === 'object' && !Array.isArray(json)) body = json as Record<string, unknown>;
+    } catch {
+      throw invalidParam('request', 'invalid request body');
+    }
+    const templateId = Number(body.templateId);
+    if (!Number.isInteger(templateId) || templateId <= 0) throw invalidParam('templateId', 'must be a positive integer');
+    const recipientUserIds = Array.isArray(body.recipientUserIds)
+      ? (body.recipientUserIds as unknown[]).map((x) => Number(x)).filter((n) => Number.isInteger(n) && n > 0)
+      : [];
+    if (recipientUserIds.length === 0) throw invalidParam('recipientUserIds', 'at least one positive integer required');
+
+    const now = Math.floor(Date.now() / 1000);
+    const svc = buildCertificateIssuanceService(c.env.DB, { auth, tenant }, parseSystemUserIds(c.env));
+    const batchPublicId = generateUlid();
+    const batchRepo = new CertificateBatchRepository({ db: c.env.DB, ctx: { auth, tenant } });
+    const batchId = await batchRepo.create({
+      publicId: batchPublicId,
+      teamId: tenant.teamId,
+      operatorId: auth.userId,
+      sourceType: 'activity',
+      sourceId: activity.id,
+      total: recipientUserIds.length,
+      now,
+    });
+    await batchRepo.markRunning(batchId, now);
+
+    const issued: Array<{ userId: number; certificatePublicId: string; certificateNo: string }> = [];
+    const alreadyIssued: Array<{ userId: number; certificatePublicId: string; certificateNo: string }> = [];
+    const notEligible: Array<{ userId: number; reason: string }> = [];
+    const failed: Array<{ userId: number; code: string }> = [];
+
+    for (const uid of recipientUserIds) {
+      if (uid === auth.userId) {
+        failed.push({ userId: uid, code: 'SELF_ISSUE_FORBIDDEN' });
+        continue;
+      }
+      const r = await svc.issue({
+        recipientUserId: uid,
+        teamId: tenant.teamId,
+        domainSource: CertificateSource.ACTIVITY,
+        sourceId: activity.id,
+        certKind: CertificateKind.PARTICIPANT,
+        templateId,
+        operatorUserId: auth.userId,
+        batchPublicId,
+      });
+      if (r.outcome === 'ISSUED') {
+        issued.push({ userId: uid, certificatePublicId: r.certificatePublicId!, certificateNo: r.certificateNo! });
+      } else if (r.outcome === 'ALREADY_ISSUED') {
+        alreadyIssued.push({ userId: uid, certificatePublicId: r.certificatePublicId!, certificateNo: r.certificateNo! });
+      } else if (r.outcome === 'NOT_ELIGIBLE') {
+        notEligible.push({ userId: uid, reason: 'NOT_ELIGIBLE' });
+      } else {
+        failed.push({ userId: uid, code: r.outcome });
+      }
+    }
+
+    await batchRepo.complete(batchId, {
+      eligible: issued.length + alreadyIssued.length + notEligible.length,
+      ineligible: notEligible.length,
+      alreadyIssued: alreadyIssued.length,
+      issued: issued.length,
+      failed: failed.length,
+      skipped: 0,
+      now,
+    });
+
+    return ok(c, {
+      activityId: activityPublicId,
+      templateId,
+      batchId: batchPublicId,
+      summary: {
+        requested: recipientUserIds.length,
+        issued: issued.length,
+        alreadyIssued: alreadyIssued.length,
+        notEligible: notEligible.length,
+        failed: failed.length,
+      },
+      issued,
+      alreadyIssued,
+      notEligible,
+      failed,
+    });
+  },
+);
+
+/**
+ * POST /api/v2/activities/:activityId/participants/:participantId/certificate/issue
+ * 单人参与证书发放。participantId = participation public_id（参与行经 signup 派生 user_id）。
+ */
+activities.post(
+  '/:activityId/participants/:participantId/certificate/issue',
+  requirePermission('certificate.certificate.issue'),
+  async (c) => {
+    const auth = c.get('auth');
+    const tenant = c.get('tenant');
+    if (!auth.authenticated) throw authRequired();
+    if (auth.userId == null) throw authRequired();
+    if (tenant.teamId == null) throw teamScopeRequired();
+
+    const activityPublicId = requireUlidParam(c.req.param('activityId'), 'activityId');
+    const participantPublicId = requireUlidParam(c.req.param('participantId'), 'participantId');
+
+    const partRepo = new ParticipationRepository({ db: c.env.DB, ctx: { auth, tenant } });
+    const activity = await partRepo.resolveActivity(activityPublicId, tenant.teamId);
+    if (activity == null) throw notFound('activity');
+    const part = await partRepo.findByPublicIdWithSignup(participantPublicId, tenant.teamId);
+    if (part == null) throw notFound('participation');
+    // 参与行归属本活动校验（防 IDOR：participantId 指向其它活动的参与行）。
+    if (part.activity_id !== activity.id) throw notFound('participation');
+
+    const recipientUserId = part.signup_user_id;
+    if (recipientUserId === auth.userId) throw forbidden('SELF_ISSUE_FORBIDDEN');
+
+    let body: Record<string, unknown> = {};
+    try {
+      const json = await c.req.json();
+      if (json != null && typeof json === 'object' && !Array.isArray(json)) body = json as Record<string, unknown>;
+    } catch {
+      body = {};
+    }
+    const templateId = Number(body.templateId);
+    if (!Number.isInteger(templateId) || templateId <= 0) throw invalidParam('templateId', 'must be a positive integer');
+
+    const svc = buildCertificateIssuanceService(c.env.DB, { auth, tenant }, parseSystemUserIds(c.env));
+    const r = await svc.issue({
+      recipientUserId,
+      teamId: tenant.teamId,
+      domainSource: CertificateSource.ACTIVITY,
+      sourceId: activity.id,
+      certKind: CertificateKind.PARTICIPANT,
+      templateId,
+      operatorUserId: auth.userId,
+    });
+
+    if (r.outcome === 'ISSUED' || r.outcome === 'ALREADY_ISSUED') {
+      return ok(c, {
+        activityId: activityPublicId,
+        participantId: participantPublicId,
+        userId: recipientUserId,
+        outcome: r.outcome,
+        certificatePublicId: r.certificatePublicId,
+        certificateNo: r.certificateNo,
+      });
+    }
+    return issuanceFailure(c, r.outcome);
+  },
+);
 
 export default activities;

@@ -28,9 +28,21 @@ import type { AuthContext } from '../types/auth';
 import { ServiceRecordService } from '../services/service-record-service';
 import { requirePermission } from '../middleware/rbac';
 import { authorizePermissionDecision } from '../services/permission-provider';
-import { ok } from '../utils/response';
-import { authRequired, invalidParam, forbidden } from '../utils/errors';
+import { ok, fail } from '../utils/response';
+import {
+  authRequired,
+  invalidParam,
+  forbidden,
+  teamScopeRequired,
+  notFound,
+  AppError,
+  ErrorCode,
+  ErrorCodeValue,
+} from '../utils/errors';
 import { isUlid } from '../utils/validation';
+import { buildCertificateIssuanceService, parseSystemUserIds } from '../services/certificate-issuance-factory';
+import { CertificateSource, CertificateKind } from '../domain/certificate';
+import { ServiceRecordRepository } from '../repository/service-records';
 
 /**
  * P35-C3B：当前 actor 在「服务时长调整」上的能力投影。
@@ -83,6 +95,30 @@ function requireServiceRecordPublicId(value: string | undefined, name: string): 
     throw invalidParam(name, 'must be a 26-char ULID or legacy L-prefixed id');
   }
   return value;
+}
+
+/**
+ * POST-R5-P5：把 CertificateIssuanceService 的确定性业务结果（outcome）映射到统一失败信封。
+ * 映射口径与 routes/activities.ts 的 issuanceFailure 完全一致（见该处注释）。
+ */
+function issuanceFailure(c: import('hono').Context, outcome: string): Response {
+  const map: Record<string, { status: number; code: ErrorCodeValue }> = {
+    NOT_ELIGIBLE: { status: 422, code: ErrorCode.VALIDATION_FAILED },
+    RECIPIENT_NOT_FOUND: { status: 404, code: ErrorCode.NOT_FOUND },
+    SOURCE_NOT_FOUND: { status: 404, code: ErrorCode.NOT_FOUND },
+    SOURCE_ID_REQUIRED: { status: 400, code: ErrorCode.INVALID_PARAM },
+    UNSUPPORTED_SOURCE: { status: 400, code: ErrorCode.INVALID_PARAM },
+    INVALID_REQUEST: { status: 400, code: ErrorCode.INVALID_PARAM },
+    ELIGIBILITY_POLICY_UNAVAILABLE: { status: 500, code: ErrorCode.INTERNAL_ERROR },
+    RECIPIENT_GUARD_UNAVAILABLE: { status: 500, code: ErrorCode.INTERNAL_ERROR },
+    CERTIFICATE_INSERT_FAILED: { status: 500, code: ErrorCode.INTERNAL_ERROR },
+    AUDIT_FAILED: { status: 500, code: ErrorCode.INTERNAL_ERROR },
+    NUMBER_POOL_UNAVAILABLE: { status: 409, code: ErrorCode.CONFLICT },
+    NUMBER_POOL_EXHAUSTED: { status: 409, code: ErrorCode.CONFLICT },
+    NUMBER_ALLOCATION_FAILED: { status: 500, code: ErrorCode.INTERNAL_ERROR },
+  };
+  const hit = map[outcome] ?? { status: 500, code: ErrorCode.INTERNAL_ERROR };
+  return fail(c, new AppError(hit.code, hit.status, `certificate issuance failed: ${outcome}`));
 }
 
 /** business_service_date 过滤值校验（YYYY-MM-DD）。 */
@@ -292,6 +328,110 @@ serviceRecords.get(
     const adjustments = await svc.listAdjustments(serviceRecordPublicId);
 
     return ok(c, { adjustments, capabilities });
+  },
+);
+
+// =========================================================================
+// POST-R5-P5：服务记录证书发放接线（SERVICE source）
+//
+// 权限：certificate.certificate.issue（D1PermissionProvider 裁决）。
+// 真实路由前缀（项目无 /admin/ 前缀）：/api/v2/service-records/...
+//   :serviceRecordPublicId 支持 ULID 或 legacy `L` + 12 位数字（0017 回填）形态。
+//
+// 纪律（与活动路由一致）：
+//   - teamId 必填（certificates / certificate_logs 为 TEAM_SCOPED）。
+//   - 本人自发证（operatorUserId === recipientUserId）→ 403 SELF_ISSUE_FORBIDDEN。
+//   - SERVICE 持久化 source_type='activity'、issue_source='service'、source_id=service_records.id
+//     （由 CertificateIssuanceService 经 domain 派生，路由只提供 numeric service_records.id）。
+// =========================================================================
+
+/** POST /api/v2/service-records/:serviceRecordPublicId/certificate/preview —— 服务证书资格预览。 */
+serviceRecords.post(
+  '/:serviceRecordPublicId/certificate/preview',
+  requirePermission('certificate.certificate.issue'),
+  async (c) => {
+    const auth = c.get('auth');
+    const tenant = c.get('tenant');
+    if (!auth.authenticated) throw authRequired();
+    if (auth.userId == null) throw authRequired();
+    if (tenant.teamId == null) throw teamScopeRequired();
+
+    const srPublicId = requireServiceRecordPublicId(c.req.param('serviceRecordPublicId'), 'serviceRecordPublicId');
+    const srRepo = new ServiceRecordRepository({ db: c.env.DB, ctx: { auth, tenant } });
+    const sr = await srRepo.findRowByPublicId(srPublicId, tenant.teamId);
+    if (sr == null) throw notFound('service_record');
+
+    let body: Record<string, unknown> = {};
+    try {
+      const json = await c.req.json();
+      if (json != null && typeof json === 'object' && !Array.isArray(json)) body = json as Record<string, unknown>;
+    } catch {
+      throw invalidParam('request', 'invalid request body');
+    }
+    const templateId = Number(body.templateId);
+    if (!Number.isInteger(templateId) || templateId <= 0) throw invalidParam('templateId', 'must be a positive integer');
+
+    const svc = buildCertificateIssuanceService(c.env.DB, { auth, tenant }, parseSystemUserIds(c.env));
+    const r = await svc.previewEligibility({
+      recipientUserId: sr.user_id,
+      teamId: tenant.teamId,
+      domainSource: CertificateSource.SERVICE,
+      sourceId: sr.id,
+    });
+    return ok(c, { serviceRecordId: srPublicId, templateId, ...r });
+  },
+);
+
+/** POST /api/v2/service-records/:serviceRecordPublicId/certificate/issue —— 服务证书发放。 */
+serviceRecords.post(
+  '/:serviceRecordPublicId/certificate/issue',
+  requirePermission('certificate.certificate.issue'),
+  async (c) => {
+    const auth = c.get('auth');
+    const tenant = c.get('tenant');
+    if (!auth.authenticated) throw authRequired();
+    if (auth.userId == null) throw authRequired();
+    if (tenant.teamId == null) throw teamScopeRequired();
+
+    const srPublicId = requireServiceRecordPublicId(c.req.param('serviceRecordPublicId'), 'serviceRecordPublicId');
+    const srRepo = new ServiceRecordRepository({ db: c.env.DB, ctx: { auth, tenant } });
+    const sr = await srRepo.findRowByPublicId(srPublicId, tenant.teamId);
+    if (sr == null) throw notFound('service_record');
+
+    const recipientUserId = sr.user_id;
+    if (recipientUserId === auth.userId) throw forbidden('SELF_ISSUE_FORBIDDEN');
+
+    let body: Record<string, unknown> = {};
+    try {
+      const json = await c.req.json();
+      if (json != null && typeof json === 'object' && !Array.isArray(json)) body = json as Record<string, unknown>;
+    } catch {
+      body = {};
+    }
+    const templateId = Number(body.templateId);
+    if (!Number.isInteger(templateId) || templateId <= 0) throw invalidParam('templateId', 'must be a positive integer');
+
+    const svc = buildCertificateIssuanceService(c.env.DB, { auth, tenant }, parseSystemUserIds(c.env));
+    const r = await svc.issue({
+      recipientUserId,
+      teamId: tenant.teamId,
+      domainSource: CertificateSource.SERVICE,
+      sourceId: sr.id,
+      certKind: CertificateKind.PARTICIPANT,
+      templateId,
+      operatorUserId: auth.userId,
+    });
+
+    if (r.outcome === 'ISSUED' || r.outcome === 'ALREADY_ISSUED') {
+      return ok(c, {
+        serviceRecordId: srPublicId,
+        userId: recipientUserId,
+        outcome: r.outcome,
+        certificatePublicId: r.certificatePublicId,
+        certificateNo: r.certificateNo,
+      });
+    }
+    return issuanceFailure(c, r.outcome);
   },
 );
 
