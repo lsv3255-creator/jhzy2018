@@ -417,4 +417,143 @@ node scripts/cert-r5b-prod-readiness-probe.mjs --profile jhzy        # TTY (OAut
 ```
 
 **READY_TO_RESUME_R5_IMPORT = YES**（wiring 完成 + 本地模拟通过 + 测试全绿），但生产 450k 导入仍须 §10.1 显式新授权短语 + 维护窗口 + 上述探针 PASS。
+
+---
+
+## 13. CERT-R5B — Resume Legacy Pool Import Execution Checklist
+
+> STATUS = **EXECUTION CHECKLIST (FROZEN)** · 本写入仅追加文档，未触碰生产。
+> 冻结于 CERT-R5B-RUNBOOK-FREEZE（2026-10-04）：记录 TTY 自跑执行序列与验收清单。
+> 不执行生产写入 / 不执行导入 / 不部署 Worker / 不 push（由本段文档写入本身保证）。
+
+### 13.1 当前 Production 基线（R5 已 apply 0045/0046，R5B 不再重做）
+
+| 维度 | 值 |
+| --- | --- |
+| migrations 总数 | 46 |
+| 0045 计数 | 1 |
+| 0046 计数 | 1 |
+| id_pools | 500 |
+| legacy_migrated | 0 |
+| v2_synthetic_compat | 500 |
+| certificates | 413 |
+
+> ⚠ **R5B 不再 apply 0045/0046**：0045/0046 已在 R5 应用且恰好各 1 次。
+> Runner 的 `validatePreconditions` 强制 `migration0045Count===1 && migration0046Count===1`；
+> 若计数偏离 → fail-closed 拒绝导入。R5B 仅续做 450,000 legacy id_pools 导入。
+
+### 13.2 凭证要求（关键）
+
+- **TTY OAuth 可用于 wrangler 只读探针**（`cert-r5b-prod-readiness-probe.mjs --profile jhzy`）。
+- **真实 `execute` 写入走 D1 REST adapter**（`createRemoteD1Adapter`），该适配器强制要求
+  `apiToken`（`CLOUDFLARE_API_TOKEN`）；OAuth 救不了写入步骤。
+- **不得把 token 写入本文档 / 任何日志**。token 只通过环境变量提供：
+
+```bash
+export CLOUDFLARE_API_TOKEN=<D1 edit token scoped to jhzy-v2-prod>
+export CLOUDFLARE_ACCOUNT_ID=8770e4917f904aed5df91c883cf058af
 ```
+
+> 以上 `<...>` 为占位符，非真实值。任何真实 token 绝不落盘。
+
+### 13.3 完整命令模板（仅维护窗口 2026-10-05 02:00–04:00 CST 内，TTY 运行）
+
+```bash
+cd /Users/Shared/projects/jhzy-v2/workers
+
+# 0) 凭证（execute 写入强制需要）
+export CLOUDFLARE_API_TOKEN=<D1 edit token scoped to jhzy-v2-prod>
+export CLOUDFLARE_ACCOUNT_ID=8770e4917f904aed5df91c883cf058af
+
+# 1) 只读探针 → ENVIRONMENT_PROOF（零写入，OAuth 可用）
+node scripts/cert-r5b-prod-readiness-probe.mjs --profile jhzy
+
+# 2) 关闭证书签发窗口（维护窗口纪律；Worker 侧路由/配置关闭）— 人工确认
+
+# 3) 450k 导入（四重守卫；不重应用 0045/0046）
+node scripts/cert-r5-protected-legacy-pool-import-runner.mjs --mode execute \
+  --db-mode remote \
+  --confirm-production-d1 d372229f-c0ae-4dcc-b968-4ec7c2832842 \
+  --confirm-account 8770e4917f904aed5df91c883cf058af \
+  --confirm-source-sha d51563b0e3149535eb66ff64a3d447a5ad9dfa1cdf26f00b680b4824c4d688bf \
+  --confirm-maintenance-window CERTIFICATE_ISSUANCE_CLOSED \
+  --confirm-i-understand-production-write
+
+# 4) 只读对账（导入后复测）
+node scripts/cert-r5b-prod-readiness-probe.mjs --profile jhzy
+
+# 5) 生产 Worker 部署
+npm run deploy:production
+```
+
+### 13.4 验收 SQL / Expected Values（只读查询）
+
+```sql
+-- 总量
+SELECT COUNT(*) FROM id_pools;                                          -- 450500
+SELECT COUNT(*) FROM id_pools WHERE provenance='legacy_migrated';       -- 450000
+SELECT COUNT(*) FROM id_pools WHERE provenance='v2_synthetic_compat';   -- 500
+SELECT COUNT(*) FROM id_pools WHERE provenance IS NULL;                 -- 0
+SELECT COUNT(*) FROM (SELECT code FROM id_pools GROUP BY code HAVING COUNT(*)>1); -- 0
+
+-- 按池（legacy + synthetic 合并；synthetic 全为 cert_trn）
+SELECT pool_type, COUNT(*) FROM id_pools GROUP BY pool_type;
+--   cert_trn=180500 cert_srv=150000 cert_hon=10000 cert_skl=10000 volunteer=100000
+
+-- 按状态（仅 legacy_migrated；synthetic 500 不计入此断言）
+SELECT status, COUNT(*) FROM id_pools WHERE provenance='legacy_migrated' GROUP BY status;
+--   0=448312 1=1661 2=27
+
+-- certificates 快照（应不变）
+SELECT COUNT(*) FROM certificates;                                      -- 413
+```
+
+| 维度 | Expected |
+| --- | --- |
+| id_pools | 450500 |
+| legacy_migrated | 450000 |
+| v2_synthetic_compat | 500 |
+| provenance NULL | 0 |
+| duplicate code groups | 0 |
+| cert_trn | 180500 |
+| cert_srv | 150000 |
+| cert_hon | 10000 |
+| cert_skl | 10000 |
+| volunteer | 100000 |
+| status 0 | 448312 |
+| status 1 | 1661 |
+| status 2 | 27 |
+| certificates | 413 |
+
+### 13.5 Legacy Anomaly：102 条 availableWithAssignedToRef
+
+- 源解析发现 `availableWithAssignedToRef=102`：102 条 `status=available` 却带非 NULL `assigned_to`。
+- 属 **legacy anomaly**，不阻断导入。
+- **不猜测** `assigned_to`（离线快照无 users 表可交叉验证）。
+- 落地规则：`assigned_to=NULL`（与 R5A 阶段裁定一致）。
+
+### 13.6 Datetime Policy
+
+- `LEGACY_DATETIME_POLICY = Asia/Shanghai / CST(+08:00)`（已冻结，CERT-R5A 落地）。
+- naive `YYYY-MM-DD HH:MM:SS` 按 Asia/Shanghai 解释 → 输出 UTC 秒 / UTC ISO。
+- NULL → null；无效值 → fail-closed（抛错，绝不臆造时间）。
+
+### 13.7 HARD STOP
+
+```
+R5B_FROZEN_CHECKLIST = YES
+PRODUCTION_D1_MUTATED_BY_THIS_DOC = NO
+PRODUCTION_WORKER_DEPLOYED_BY_THIS_DOC = NO
+GIT_PUSH_PERFORMED = NO
+
+不得重新 apply 0045/0046
+不得触碰 JHZY 1.0 live
+不得修 public verify
+不得执行无关任务
+不得 push
+```
+
+### 13.8 Secret / PII Scan（文档级）
+
+本段文档不得出现：真实 token、手机号、OpenID、身份证、真实姓名、session token、raw cert_no、raw pool code。
+全部命令中 token 仅为 `<D1 edit token scoped to jhzy-v2-prod>` 占位符；DB UUID / Account ID 为公开部署标识符，非 secret。
