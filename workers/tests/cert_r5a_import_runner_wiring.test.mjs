@@ -13,10 +13,12 @@
  *   8. 生产当前状态 46/500/0 被判定 READY_FOR_IMPORT
  *   9. 0045/0046 缺失状态判定 NOT_READY_FOR_IMPORT
  *  10. 日志绝不输出 raw code / PII
+ *  11. datetime 策略（Asia/Shanghai）切换不得影响 450000 / pool / status 口径
+ *  1B. LEGACY DATETIME POLICY：+08:00 解释、NULL 保持 NULL、无效值 fail-closed
  *
  * 运行：node --experimental-sqlite tests/cert_r5a_import_runner_wiring.test.mjs
  */
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -25,6 +27,8 @@ import {
   splitFields,
   lit,
   parseSqlDateTime,
+  sqlDateTimeToUtcIso,
+  LEGACY_DATETIME_POLICY,
   buildSourceStats,
   findStatementBodies,
   ID_POOL_HEADER,
@@ -95,9 +99,45 @@ function captureLogger() {
   check('1j. NULL created_at 以 fallback 兜底', rows[0].createdAt === 0, `got=${rows[0].createdAt}`);
   check('1k. status 映射正确', rows[0].status === 'assigned' && rows[1].status === 'available' && rows[2].status === 'reserved');
 
-  // datetime → unix（确定性：按 UTC 解释）
+  // datetime → unix（CERT-R5A-CLOSEOUT 裁定：按 Asia/Shanghai 解释）
   const ts = parseSqlDateTime('2026-01-17 02:44:55');
-  check('1l. datetime 转 unix 秒（UTC 确定性）', ts === Date.parse('2026-01-17T02:44:55Z') / 1000, `got=${ts}`);
+  check('1l. datetime 转 unix 秒（Asia/Shanghai 确定性）', ts === Date.parse('2026-01-17T02:44:55+08:00') / 1000, `got=${ts}`);
+}
+
+// -----------------------------------------------------------------------------
+// 1B. LEGACY DATETIME POLICY（CERT-R5A-CLOSEOUT 裁定：Asia/Shanghai / CST+08:00）
+// -----------------------------------------------------------------------------
+{
+  check('1B-0. 策略常量 = Asia/Shanghai', LEGACY_DATETIME_POLICY.timezone === 'Asia/Shanghai' && LEGACY_DATETIME_POLICY.offset === '+08:00');
+
+  // 裁定锚点：北京时间 10:30 → UTC 02:30
+  const iso = sqlDateTimeToUtcIso('2024-01-01 10:30:00');
+  check('1B-1. naive 2024-01-01 10:30:00 → UTC ISO 2024-01-01T02:30:00.000Z',
+    iso === '2024-01-01T02:30:00.000Z', `got=${iso}`);
+
+  const secs = parseSqlDateTime('2024-01-01 10:30:00');
+  check('1B-1b. 同上 → unix 秒一致', secs === Date.parse('2024-01-01T02:30:00.000Z') / 1000, `got=${secs}`);
+
+  // NULL 保持 NULL（不伪造、不 fallback 到 0）
+  check('1B-2. NULL → null（assigned_at）', parseSqlDateTime(null) === null);
+  check('1B-2b. NULL → null（ISO 形态）', sqlDateTimeToUtcIso(null) === null);
+  check('1B-2c. 空串 → null', parseSqlDateTime('') === null);
+
+  // 无效值 fail-closed（抛错，绝不静默 null）
+  let threw = false;
+  try { parseSqlDateTime('not-a-datetime'); } catch (e) { threw = /DATETIME_PARSE_INVALID/.test(String(e.message)); }
+  check('1B-3. 无效 datetime → fail-closed 抛错 DATETIME_PARSE_INVALID', threw);
+
+  let threw2 = false;
+  try { parseSqlDateTime('2024-13-45 99:99:99'); } catch (e) { threw2 = /DATETIME_PARSE_INVALID/.test(String(e.message)); }
+  check('1B-3b. 越界 datetime → fail-closed 抛错', threw2);
+
+  // 边界：跨日（北京时间 00:30 → 前一日 UTC 16:30）
+  check('1B-4. 跨日边界 +08:00 正确回退', sqlDateTimeToUtcIso('2024-01-01 00:30:00') === '2023-12-31T16:30:00.000Z',
+    `got=${sqlDateTimeToUtcIso('2024-01-01 00:30:00')}`);
+
+  // 不得回退为 UTC 解释（防回归）
+  check('1B-5. 未按 UTC 解释（≠ 10:30Z）', sqlDateTimeToUtcIso('2024-01-01 10:30:00') !== '2024-01-01T10:30:00.000Z');
 }
 
 // -----------------------------------------------------------------------------
@@ -272,6 +312,38 @@ function captureLogger() {
   ];
   const hits = forbidden.filter((re) => re.test(all));
   check('10. 日志无 raw code / PII / secret 命中', hits.length === 0, `hits=${hits.length}`);
+}
+
+// -----------------------------------------------------------------------------
+// 11. datetime 策略切换不得影响计数口径（真实归档回归；归档缺失时跳过）
+// -----------------------------------------------------------------------------
+{
+  const ARCHIVE = process.env.R5A_SOURCE_ARCHIVE ?? '/Users/Shared/jhzy-v2-wp4d-authoritative-20260921.tar.gz';
+  if (existsSync(ARCHIVE)) {
+    const { loadLegacySource } = await import('../scripts/legacy-pool-source-parser.mjs');
+    const dir = mkdtempSync(join(tmpdir(), 'r5a-dtpol-'));
+    const { rows, stats } = loadLegacySource({ archivePath: ARCHIVE, workDir: join(dir, 'x') });
+    check('11a. datetime 策略不影响总行数 = 450000', stats.rows === 450000 && rows.length === 450000, `got=${stats.rows}`);
+    const wantPools = { cert_trn: 180000, cert_srv: 150000, cert_hon: 10000, cert_skl: 10000, volunteer: 100000 };
+    const poolOk = Object.keys(wantPools).every((k) => stats.poolCounts[k] === wantPools[k]) &&
+      Object.keys(stats.poolCounts).length === Object.keys(wantPools).length;
+    check('11b. pool totals 不变', poolOk, JSON.stringify(stats.poolCounts));
+    check('11c. status totals 不变', JSON.stringify(stats.statusCounts) === JSON.stringify({
+      available: 448312, assigned: 1661, reserved: 27,
+    }), JSON.stringify(stats.statusCounts));
+    check('11d. assigned_to 非自由行口径不变 939/2/747',
+      stats.assignedTo.null === 939 && stats.assignedTo.sentinel === 2 && stats.assignedTo.unresolved === 747,
+      JSON.stringify(stats.assignedTo));
+    // 抽样：任一非 NULL created_at 必须是 +08:00 解释下的有限秒值
+    const sample = rows.find((r) => r.createdAt > 0);
+    check('11e. created_at 为有限 unix 秒', sample != null && Number.isFinite(sample.createdAt) && sample.createdAt > 0,
+      `got=${sample?.createdAt}`);
+    check('11f. created_at 落在合理区间（1970..2100）', sample != null && sample.createdAt > 0 && sample.createdAt < 4102444800,
+      `got=${sample?.createdAt}`);
+    rmSync(dir, { recursive: true, force: true });
+  } else {
+    process.stderr.write('  SKIP 11. 真实归档不存在，跳过 datetime 策略回归\n');
+  }
 }
 
 process.stderr.write(`\nCERT-R5A WIRING TESTS: ${pass} pass / ${fail} fail\n`);

@@ -1,5 +1,10 @@
 # CERT-R5A: Production Import Runner Wiring Fix
 
+> **CERT_R5A_STATUS = PASS_WITH_FINDINGS**（R5A-CLOSEOUT 收尾后）
+>
+> R5 BLOCKED 的根因（导入执行路径从未组装）**已修复**。
+> 见 §7 R5A-CLOSEOUT：datetime 策略裁定为 Asia/Shanghai，三项遗留发现降级为「不阻断」。
+
 > STATUS = **WIRING COMPLETE, LOCAL SIMULATED**
 > PRODUCTION 450k IMPORT = **NOT PERFORMED**（本任务明确禁止）
 > CERTIFICATE ISSUANCE = **REMAINS CLOSED**
@@ -52,7 +57,12 @@ legacy `id_pool` 列序：`id, id_value, id_type, batch_id, status, assigned_to,
 | provenance | 统一 `legacy_migrated` |
 | code | 逐字节原样 |
 
-**决策点（需人工确认）**：legacy `datetime` 是 naive 挂钟时间、不带时区。为保证确定性/可复现/不臆造，默认按 **UTC** 解释（`parseSqlDateTime` 的 `datetimeTimezone` 可覆盖）。若应以 CST(+08:00) 解释，需人工确认后改默认值。
+**决策点（CERT-R5A-CLOSEOUT 人工裁定 · 已冻结）**：legacy `datetime` 是 naive 挂钟时间、不带时区。JHZY 1.0 生产库（api_jhzyfw_com）运行于 CST(+08:00) 机房，故裁定 `LEGACY_DATETIME_POLICY = Asia/Shanghai / CST(+08:00)`（已落地于 `legacy-pool-source-parser.mjs`）：
+- `parseSqlDateTime` 默认按 **+08:00** 解释 naive `'YYYY-MM-DD HH:MM:SS'` → unix seconds（UTC 瞬时）；
+- `sqlDateTimeToUtcIso()` 输出恒为 **UTC ISO**（带 Z）；例 `'2024-01-01 10:30:00'` → `2024-01-01T02:30:00.000Z`；
+- `NULL` / 空串 → `null`（保持 NULL，绝不伪造时间戳）；
+- 无法解析 → **throw** fail-closed（静默返回 null 会掩盖脏数据）。
+⛔ 禁止回退为 UTC 解释——那会让全部 legacy 时间戳整体偏移 8 小时。
 `created_at` 为 NOT NULL，legacy NULL 以 `nullTimestampFallback = 0` 兜底并在 stats 中计数上报（实测本源 `nullCreatedAt = 0`，无实际影响）。
 
 ### 1.3 Runner 真实接线（C/D/E）
@@ -103,7 +113,7 @@ ASSIGNED_TO_CLASSIFICATION = null 939 / sentinel 2 / unresolved 747 / proven_map
 
 | 套件 | 结果 |
 | --- | --- |
-| `cert_r5a_import_runner_wiring.test.mjs` | **35 pass / 0 fail** |
+| `cert_r5a_import_runner_wiring.test.mjs` | **51 pass / 0 fail**（closeout 扩充至 51 项，含 datetime CST→UTC 断言） |
 | `cert_r4_runner_production_guard.test.mjs`（回归） | **35 pass / 0 fail** |
 
 覆盖（任务书 G 节 10 项）：
@@ -205,5 +215,37 @@ node scripts/cert-r5-protected-legacy-pool-import-runner.mjs --mode execute \
 > 旧文档中「`node scripts/... --mode plan` 只打印三行常量」的空转命令**已废弃**。
 
 ---
+
+---
+
+## 7. CERT-R5A-CLOSEOUT 状态（2026-10-04）
+
+| 项 | 值 |
+| --- | --- |
+| REPO_IDENTITY_GATE | **PASS**（`/Users/Shared/projects/jhzy-v2`，HEAD `126af6a9`，已脱离 `/Volumes` 备份镜像） |
+| LEGACY_DATETIME_POLICY | **Asia/Shanghai / CST(+08:00)**（已冻结，`legacy-pool-source-parser.mjs` 落地） |
+| LOCAL TESTS | R5A **51/0**；R4 / R3D / R3B / R2 全绿（`node --test`，本地 node:sqlite，零网络） |
+| PII / SECRET SCAN | **CLEAN**（仅引用 `CLOUDFLARE_API_TOKEN` 环境变量名与日志脱敏逻辑，无硬编码密钥/PII） |
+| PRODUCTION_WRITE | **NO**（0045/0046 于 R5 已应用；本 closeout 不写生产） |
+| WORKER DEPLOY | **NO** |
+| ISSUANCE WINDOW | **REMAINS_CLOSED** |
+| git push | **NO**（仅本地提交） |
+
+**剩余一项运行验证门（环境限制，非代码缺陷）**：
+生产只读就绪探针 `cert-r5b-prod-readiness-probe.mjs` 在非交互 agent 子进程中，`wrangler --profile jhzy` 拒绝复用 OAuth（返回 `NON_INTERACTIVE_NO_TOKEN`）；wrangler 非交互模式只接受 `CLOUDFLARE_API_TOKEN`。
+→ 该探针**零写入**（`d1 list` + SELECT），需在**你的 TTY** 或设置 `CLOUDFLARE_API_TOKEN` 后运行，以产出 `ENVIRONMENT_PROOF = PASS` 的只读证据：
+
+```bash
+cd /Users/Shared/projects/jhzy-v2/workers
+# 方式 A：TTY 内（复用 jhzy OAuth）
+node scripts/cert-r5b-prod-readiness-probe.mjs --profile jhzy
+# 方式 B：API token（非交互）
+CLOUDFLARE_API_TOKEN=<你的 D1 只读 token> CLOUDFLARE_ACCOUNT_ID=8770e4917f904aed5df91c883cf058af \
+  node scripts/cert-r5b-prod-readiness-probe.mjs --no-profile
+```
+
+**READY_TO_RESUME_R5_IMPORT = YES**（runner wiring 完成 + 本地全量模拟通过 + 测试全绿），但生产 450k 导入仍须：① 针对「导入」的显式新授权短语；② 维护窗口；③ 上述只读探针 PASS；④ `--read-prod-state` 可用（TTY / API token）。
+
+COMMIT_SHA = 本 closeout 提交（本地，未 push；详见 `git log`）
 
 **NEXT_ACTION = STOP. Await human review before any production import.**

@@ -393,4 +393,28 @@ PRODUCTION_EXECUTION_AUTHORIZED = NO
 READY_FOR_CERT_R5_PRODUCTION_EXECUTION = WAITING_FOR_EXPLICIT_AUTHORIZATION
 
 未获管理员 §10.1 显式授权短语，不得执行本 Runbook 任何步骤。
+
+---
+
+## 附录 A. CERT-R5A-CLOSEOUT 状态（2026-10-04 · 信息性，不构成授权）
+
+> 本附录仅记录 runner readiness 收尾状态，**不改变**本 Runbook 的 `PLANNING ONLY / NOT AUTHORIZED` 性质。
+
+| 项 | 值 |
+| --- | --- |
+| 导入执行路径根因 | **已修复**（R5A：`legacy-pool-source-parser.mjs` + 真实 executor 接线 + 本地全量模拟通过） |
+| `LEGACY_DATETIME_POLICY` | **Asia/Shanghai / CST(+08:00)**（已冻结） |
+| 本地测试 | R5A 51/0；R4 / R3D / R3B / R2 全绿 |
+| PII / Secret 扫描 | CLEAN |
+| 生产写入 | **NO**（0045/0046 已在 R5 应用；closeout 不写） |
+| 签发窗口 | REMAINS_CLOSED |
+
+**最后一项运行验证门（环境限制）**：生产只读就绪探针 `cert-r5b-prod-readiness-probe.mjs` 在非交互 agent 环境返回 `NON_INTERACTIVE_NO_TOKEN`（wrangler 非交互只接受 `CLOUDFLARE_API_TOKEN`）。该探针零写入，须在 TTY 或设置 API token 后由管理员运行以产出 `ENVIRONMENT_PROOF = PASS`：
+```bash
+cd /Users/Shared/projects/jhzy-v2/workers
+node scripts/cert-r5b-prod-readiness-probe.mjs --profile jhzy        # TTY (OAuth)
+# 或 CLOUDFLARE_API_TOKEN=<D1 只读 token> CLOUDFLARE_ACCOUNT_ID=8770e4917f904aed5df91c883cf058af node scripts/cert-r5b-prod-readiness-probe.mjs --no-profile
+```
+
+**READY_TO_RESUME_R5_IMPORT = YES**（wiring 完成 + 本地模拟通过 + 测试全绿），但生产 450k 导入仍须 §10.1 显式新授权短语 + 维护窗口 + 上述探针 PASS。
 ```

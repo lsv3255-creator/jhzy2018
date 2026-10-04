@@ -11,6 +11,8 @@
 > **后续**：根因已由 CERT-R5A 修复，见
 > `32-cert-r5a-import-runner-wiring.md`（wiring 完成 + 本地全量模拟通过）。
 > R5A 同样**未执行**生产导入；生产仍为下述中间态。
+>
+> **CERT-R5A-CLOSEOUT 补充（2026-10-04）**：导入执行路径根因已修复（见 `32-cert-r5a-import-runner-wiring.md` §7）；`LEGACY_DATETIME_POLICY` 已冻结为 **Asia/Shanghai / CST(+08:00)**；本地测试全绿（R5A 51/0 + R4/R3D/R3B/R2）、PII/Secret 扫描 clean；**生产只读环境证明**为最后一项运行验证门，需在 TTY 或 `CLOUDFLARE_API_TOKEN` 下运行 `cert-r5b-prod-readiness-probe.mjs`（零写入）。本文件仍为 BLOCKED 执行记录，未改变。
 
 ---
 

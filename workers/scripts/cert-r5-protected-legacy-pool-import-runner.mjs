@@ -547,12 +547,33 @@ export async function readProdStateViaWrangler({
       duplicateCodeGroups: pick('duplicateCodeGroups'),
     };
   } catch (e) {
-    // 诊断信息只取短摘要（不含任何 secret）；wrangler 在无 TTY 且无
-    // CLOUDFLARE_API_TOKEN 时会拒绝执行，此时降级为「前置状态不可用」，
-    // 由守卫按缺失状态给出 NOT_READY（fail-closed），不阻断 plan/dry-run。
-    const detail = String(e?.stderr ?? e?.message ?? e).slice(0, 200).replace(/\s+/g, ' ');
-    return { ok: false, reason: `WRANGLER_READ_FAILED: ${detail}` };
+    // ⚠ wrangler 的 --json 错误体写在 **stdout**（不是 stderr），早期版本只读 stderr
+    // 导致原因被 Proxy 警告淹没。此处两者都取，并做原因分类（不含任何 secret）。
+    const strip = (s) => String(s ?? '').replace(/\x1b\[[0-9;]*m/g, '').replace(/\s+/g, ' ').trim();
+    const detail = `${strip(e?.stdout)} ${strip(e?.stderr)}`.trim();
+    return {
+      ok: false,
+      reason: classifyWranglerFailure(detail),
+    };
   }
+}
+
+/**
+ * 把 wrangler 失败原因分类为可执行的处置建议。
+ * 只做子串匹配，绝不回显 token/凭据本体。
+ */
+export function classifyWranglerFailure(detail) {
+  const d = String(detail ?? '');
+  if (/non-interactive environment/i.test(d) && /CLOUDFLARE_API_TOKEN/i.test(d)) {
+    return 'NON_INTERACTIVE_NO_TOKEN: 需 CLOUDFLARE_API_TOKEN 或在 TTY 中运行';
+  }
+  if (/Timed out waiting for authorization code/i.test(d)) {
+    return 'AUTH_SESSION_EXPIRED: wrangler 登录态已过期，需重新 wrangler login（TTY 内完成浏览器授权）';
+  }
+  if (/Invalid access token|Authentication error/i.test(d)) {
+    return 'AUTH_TOKEN_REJECTED: 提供的 API token 被 Cloudflare 拒绝（权限不足或已失效）';
+  }
+  return `WRANGLER_READ_FAILED: ${d.slice(0, 160)}`;
 }
 
 /**

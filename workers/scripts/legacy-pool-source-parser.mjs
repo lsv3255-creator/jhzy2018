@@ -161,17 +161,56 @@ export function lit(field) {
 }
 
 /**
- * MySQL naive datetime（'YYYY-MM-DD HH:MM:SS'）→ unix seconds。
+ * =============================================================================
+ * LEGACY DATETIME POLICY（CERT-R5A-CLOSEOUT 人工裁定 · 冻结）
+ * =============================================================================
  *
- * 决策（需人工确认，见 32-cert-r5a-*.md）：dump 中的 datetime 是 naive 挂钟时间，
- * 不带时区。为保持【确定性、可复现、不臆造】，默认按 UTC 解释。
- * 可通过 opts.datetimeTimezone 指定带偏移的后缀（如 '+08:00'）。
+ * MySQL dump 中的 `DATETIME` 是 **naive 挂钟时间**，不带时区信息。
+ * JHZY 1.0 生产库（api_jhzyfw_com）运行在 CST(+08:00) 机房，
+ * 因此权威裁定为：
+ *
+ *   LEGACY_DATETIME_POLICY = Asia/Shanghai / CST(+08:00)
+ *
+ * 即：'2024-01-01 10:30:00' 表示 **北京时间 2024-01-01 10:30:00**，
+ * 对应 UTC 瞬时 = '2024-01-01T02:30:00.000Z'。
+ *
+ * 存储形态仍为 unix seconds（与 V2 `id_pools.assigned_at / created_at` 一致）；
+ * 需要 ISO 文本时用 `sqlDateTimeToUtcIso()`，输出恒为 **UTC ISO**（带 Z）。
+ *
+ * ⛔ 禁止回退为 UTC 解释——那会让全部 legacy 时间戳整体偏移 8 小时。
  */
-export function parseSqlDateTime(value, { datetimeTimezone = 'Z' } = {}) {
-  if (value == null || value === '') return null;
-  const iso = String(value).trim().replace(' ', 'T') + datetimeTimezone;
+export const LEGACY_DATETIME_POLICY = Object.freeze({
+  timezone: 'Asia/Shanghai',
+  offset: '+08:00',
+  /** 人类可读裁定口径，供文档/日志引用（不含任何源数据）。 */
+  label: 'Asia/Shanghai / CST(+08:00)',
+});
+
+/** MySQL naive datetime → UTC ISO 字符串（毫秒精度，带 Z）。NULL → null。 */
+export function sqlDateTimeToUtcIso(value, opts) {
+  const seconds = parseSqlDateTime(value, opts);
+  return seconds == null ? null : new Date(seconds * 1000).toISOString();
+}
+
+/**
+ * MySQL naive datetime（'YYYY-MM-DD HH:MM:SS'）→ unix seconds（UTC 瞬时）。
+ *
+ * - NULL / 空串 → null（保持 NULL，绝不伪造时间戳）
+ * - 默认按 LEGACY_DATETIME_POLICY（Asia/Shanghai, +08:00）解释
+ * - 无法解析 → **throw**（fail-closed；静默返回 null 会掩盖脏数据）
+ * - 可通过 opts.datetimeTimezone 覆盖（仅供测试/对照，生产不得覆盖）
+ */
+export function parseSqlDateTime(value, { datetimeTimezone = LEGACY_DATETIME_POLICY.offset } = {}) {
+  if (value == null) return null;
+  const raw = String(value).trim();
+  if (raw === '') return null;
+  const iso = raw.replace(' ', 'T') + datetimeTimezone;
   const ms = Date.parse(iso);
-  return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
+  if (!Number.isFinite(ms)) {
+    // fail-closed：不打印原始值本体（可能含业务数据），只报长度与形状
+    throw new Error(`DATETIME_PARSE_INVALID len=${raw.length} shape=${/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(raw) ? 'ok' : 'bad'}`);
+  }
+  return Math.floor(ms / 1000);
 }
 
 // -----------------------------------------------------------------------------
