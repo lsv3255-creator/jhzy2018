@@ -215,7 +215,7 @@ TEST_SESSIONS_STATUS = INVALIDATED (T2 session id=991010 status=2; 0 active)
 ID_POOL_RECOVERY = NO (pools 25775/25776 retained status=1)
 CLEANUP_ACTION = NONE_REQUIRED (both certs already revoked; session already invalidated)
 RETENTION_POLICY = DEFINED (see §9)
-DOC_COMMIT_SHA = <见 git 提交后回填>
+DOC_COMMIT_SHA = eb61901d931109fc6d056e205fee6890d78e5900
 SECRET_PII_SCAN = PASS (no token/phone/OpenID/idcard/realname/session/raw cert_no/raw pool code)
 GIT_PUSH_PERFORMED = NO
 NEXT_ACTION = 如需彻底移除 TEST team/user/activity 等 artifact，单独设计 FK 逆序清理脚本；评估 cert_srv 号池正式安全回收机制；后续 HTTP route 回归测试仅在必要版本时执行
