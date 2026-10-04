@@ -189,7 +189,7 @@ CLEANUP_STATUS = REVOKED (TEST_ARTIFACT_RETAINED: 已撤销留存, 编号未回�
 PRODUCTION_D1_MUTATED = YES_TEST_ONLY
 REAL_BUSINESS_CERTIFICATE_ISSUED = NO
 GIT_PUSH_PERFORMED = NO
-DOC_COMMIT_SHA = <见 git 提交后回填>
+DOC_COMMIT_SHA = be154281f783ef00c63e52a39798076e7fd705eb
 SECRET_PII_SCAN = PASS (无 token/手机号/OpenID/身份证/真实姓名/session/raw cert_no/raw pool code)
 NEXT_ACTION = 取得安全 team_admin TEST token 或 wrangler dev --remote 测试态，以闭环真实 HTTP issue route；并建独立 TEST 清理/撤销工具
 ```
