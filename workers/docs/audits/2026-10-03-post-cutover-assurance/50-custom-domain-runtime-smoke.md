@@ -10,18 +10,18 @@
 ## 0. 验收摘要（Final Return 占位）
 
 ```
-POST_R5_P8H_STATUS     = RECORDED / HEALTH_PASS
+POST_R5_P8H_STATUS     = CLOSEOUT_DONE / HEALTH_PASS / D1_NO_MUTATION
 HOSTNAME               = v2-smoke.signivra.com
 HEALTH_SMOKE           = PASS
 MINE_SMOKE             = SKIPPED_NO_SAFE_AUTH
-D1_MUTATION_CHECK      = NO MUTATION（详见 §6）
+D1_MUTATION_CHECK      = NO MUTATION（实时 SELECT 8/8 匹配，详见 §6）
 CERTIFICATE_ISSUED     = NO
 PRODUCTION_D1_MUTATED  = NO
 ISSUE_ROUTE_CALLED     = NO
 JHZY_1_0_TOUCHED       = NO
 GIT_PUSH_PERFORMED     = NO
-DOC_COMMIT_SHA         = <pending：Bash 工具在本次执行中不可用，待恢复后提交>
-NEXT_ACTION            = 待 Bash 恢复 → 跑实时 D1 SELECT 复核 + git add/commit doc 50
+DOC_COMMIT_SHA         = d714626c5aefd619ecdaab4f37a03bb06e114c3b
+NEXT_ACTION            = P8H 闭环完成；route 保留待后续授权（POST-R5-P8H-CLEANUP）或 R5/P9 后删除决策
 ```
 
 ---
