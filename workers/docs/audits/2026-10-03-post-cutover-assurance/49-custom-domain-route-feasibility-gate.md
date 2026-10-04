@@ -6,9 +6,11 @@
 > 部署版本（不变）：`3cb9d6f5-11a8-4588-930d-e58dfd1b7ea7`
 > 生产 D1（不变）：`jhzy-v2-prod / d372229f-c0ae-4dcc-b968-4ec7c2832842`
 >
-> **结论：`ROUTE_FEASIBILITY = BLOCKED_NO_ZONE_INVENTORY`**
-> **根因：当前环境不具备 zone / route 的只读列举能力（无 API token + wrangler 无该命令）。**
-> **本轮未创建任何 route、未改任何 DNS、未部署、未动生产 D1。**
+> **结论：`ROUTE_FEASIBILITY = FEASIBLE`**
+> **Inventory 已完成**：account `8770e4917f904aed5df91c883cf058af` 下 4 个 zone 全部清点，
+> Workers Routes 均为 0，且**无 `jhzyfw.com` zone**（1.0 hostname 在另一账户，天然隔离）。
+> **推荐候选：`v2-smoke.signivra.com`**（signivra.com 仅 1 条占位 DNS 记录、零 route，blast radius 最小）。**
+> **本轮仅做只读 inventory：未创建任何 route、未改任何 DNS、未部署、未动生产 D1。**
 
 ---
 
@@ -16,13 +18,13 @@
 
 | 项 | 结果 |
 |---|---|
-| `POST_R5_P8G_STATUS` | **FEASIBILITY_GATED / BLOCKED** |
+| `POST_R5_P8G_STATUS` | **FEASIBILITY_COMPLETE / FEASIBLE** |
 | `CLOUDFLARE_ACCOUNT` | `8770e4917f904aed5df91c883cf058af`（**已证明**） |
-| `AVAILABLE_ZONES` | **UNKNOWN**（无法列举） |
-| `EXISTING_WORKER_ROUTES` | **UNKNOWN**（无法列举） |
-| `CANDIDATE_HOSTNAME` | **无法确定**（依赖 zone inventory） |
-| `ROUTE_FEASIBILITY` | **BLOCKED_NO_ZONE_INVENTORY** |
-| `RECOMMENDED_PLAN` | 方案 A（临时 smoke hostname）—— **待 inventory 完成后方可定稿** |
+| `AVAILABLE_ZONES` | **4**（`aidongcheng.com` / `dongcheng-tech.com` / `mootlsv.com` / `signivra.com`） |
+| `EXISTING_WORKER_ROUTES` | **0**（4 个 zone 全部为 0 route） |
+| `CANDIDATE_HOSTNAME` | **`v2-smoke.signivra.com`**（推荐） |
+| `ROUTE_FEASIBILITY` | **FEASIBLE** |
+| `RECOMMENDED_PLAN` | 方案 A（临时 smoke hostname）—— **已定稿：`v2-smoke.signivra.com`** |
 | `ROUTE_CREATED` | **NO** |
 | `DNS_CHANGED` | **NO** |
 | `PRODUCTION_D1_MUTATED` | **NO** |
@@ -102,7 +104,7 @@ accounts/8770e4917f904aed5df91c883cf058af
 
 ---
 
-## 4. Zone / Route Inventory —— 无法完成（核心阻塞）
+## 4. Zone / Route Inventory —— 已完成（只读 token 补齐）
 
 ### 4.1 阻塞原因
 
@@ -132,7 +134,7 @@ zone inventory 需要 Cloudflare API token，当前环境**不具备**：
 > 「`cert-r5b-prod-readiness-probe.mjs` 在非交互 agent 环境返回 `NON_INTERACTIVE_NO_TOKEN`
 > （wrangler 非交互只接受 `CLOUDFLARE_API_TOKEN`）」——与本轮观察一致。
 
-### 4.3 结论
+### 4.3 第一轮阻塞结论（保留作审计轨迹）
 
 ```
 AVAILABLE_ZONES        = UNKNOWN
@@ -142,7 +144,56 @@ ROUTE_FEASIBILITY      = BLOCKED_NO_ZONE_INVENTORY
 
 **按指令 §3-B 规定**：无可用 zone 清单时不得臆测候选域名，
 更**不得建议动用 `api.jhzyfw.com`**（1.0 生产 API 硬禁令）。
-故本轮**不提出具体 hostname**，仅在 §6 给出条件式方案。
+故第一轮**不提出具体 hostname**，仅在 §6 给出条件式方案。
+
+> **补充（2026-10-04 第二轮）：用户提供了具备只读权限的 API token，
+> zone / route inventory 已补全，见 §4.4。上述 §4.1–§4.3 为第一轮阻塞时的记录，保留作审计轨迹。**
+
+### 4.4 Inventory 实测结果（只读 token，2026-10-04）
+
+token 权限经 `GET /user/tokens/verify` 验证为 **active**，过期 `2026-10-05T23:59:59Z`。
+仅执行只读 `GET`：verify / zones / dns_records / workers/routes。**未写入任何资源。**
+
+#### 4.4.1 Zones（4 个，全部 active）
+
+| Zone ID | Zone Name | 现有 DNS 记录数 | 现有 Workers Routes |
+|---|---|---|---|
+| `45bf9137168b56a09e2cbc0ebbc9e680` | `aidongcheng.com` | 12 | 0 |
+| `d0b75ed248b9664438d4079262b1700f` | `dongcheng-tech.com` | 16 | 0 |
+| `330795cf43fc40b923e34f67e9ec3e06` | `mootlsv.com` | 14 | 0 |
+| `44d09217b82f7f46bb77d3943b8244a1` | `signivra.com` | 1 | 0 |
+
+**关键结论**：4 个 zone **均非 `jhzyfw.com`** → 1.0 的 `api.`/`api2.`/`exam.`/`manage.`/`signup.`/`admin.jhzyfw.com`
+在**另一个 Cloudflare 账户**管理，本账户**不存在任何 1.0 hostname**，碰撞风险为 0。
+**全部 4 个 zone 的 Workers Routes = 0** → 无 route 占用冲突。
+
+#### 4.4.2 候选子域冲突检查
+
+逐 zone 扫描现有 DNS 记录，确认 `v2-smoke` / `smoke` / `jhzy-v2` 前缀**均不存在**：
+
+- `aidongcheng.com`：admin / ai / douying / itn / jiaoliu … 无 `v2-smoke`
+- `dongcheng-tech.com`：panel / reality / ss / trojan / ws / douying … 无 `v2-smoke`
+- `mootlsv.com`：beijing / travel / jhzyjs / nanhu / wish / 500wan / beij5 / marksix … 无 `v2-smoke`
+  （注：`jhzyjs.mootlsv.com` 已存在，但非 `v2-smoke`，不冲突）
+- `signivra.com`：仅 `AAAA 100::`（apex 占位），无 `v2-smoke`
+
+→ **`v2-smoke.<任意 4 zone 之一>` 均为可用、无冲突的安全候选。**
+
+#### 4.4.3 推荐候选
+
+| 候选 | 评估 |
+|---|---|
+| **`v2-smoke.signivra.com`**（推荐） | signivra.com 仅 1 条占位 DNS 记录、零 route；用户自有 Signivra 项目 zone；blast radius 最小；清理只需删 1 route + 1 DNS 记录 |
+| `v2-smoke.mootlsv.com` | 可用，但 mootlsv.com 承载 beijing/travel/jhzyjs 等活跃服务，牵连面略大 |
+| `v2-smoke.aidongcheng.com` | 可用，但承载 itn（教程站）/admin 等活跃服务 |
+| `v2-smoke.dongcheng-tech.com` | 可用，但含 panel/ss/trojan/ws 等子域，语义不相关，不推荐 |
+
+#### 4.4.4 技术前提（route 创建时需注意）
+
+Cloudflare 自定义域名 route 要使 `https://v2-smoke.signivra.com` 可达，
+**除 route 外还需一条橙云（proxied）DNS 记录**（CNAME/A 指向 Worker）。
+该 DNS 记录属写操作，不在本任务范围，留待后续授权任务执行。
+`workers_dev: true` 保持不变，route 删除后不影响 workers.dev 访问路径。
 
 ---
 
@@ -161,14 +212,13 @@ ROUTE_FEASIBILITY      = BLOCKED_NO_ZONE_INVENTORY
 | `signup.jhzyfw.com` | `/www/wwwroot/signup.jhzyfw.com` |
 | `admin.jhzyfw.com` | 2.0 配置中作为 `ADMIN_ALLOWED_ORIGINS` 出现 |
 
-### 5.2 冲突风险评估
+### 5.2 冲突风险评估（已按 inventory 修正）
 
-**`jhzyfw.com` 若为可用 zone，则候选子域与 1.0 共用 zone。** 因此：
-
-- 候选 hostname **必须**是 1.0 未使用的新子域（如 `v2-smoke.jhzyfw.com`）
-- **绝不可**复用 `api.` / `api2.` / `exam.` / `manage.` / `signup.` / `admin.` 前缀
-- 创建前**必须**先做 DNS 记录冲突检查（指令 §3-C 要求）
-- **绝不可**覆盖任何已有 A / CNAME 记录
+**Inventory 实测：`jhzyfw.com` 不在本 account `8770e4917f904aed5df91c883cf058af` 内**
+（4 个 zone 均非 jhzyfw.com）→ 1.0 hostname 在另一账户管理。
+因此本账户内创建 `v2-smoke.<zone>` **天然不可能触碰 1.0**。
+为稳妥仍保留禁止清单：绝不可复用 `api.`/`api2.`/`exam.`/`manage.`/`signup.`/`admin.` 前缀，
+且创建前仍须做 DNS/route 冲突检查（§4.4.2 已确认无冲突）。
 
 ### 5.3 2.0 当前的域名声明
 
@@ -189,7 +239,7 @@ ROUTE_FEASIBILITY      = BLOCKED_NO_ZONE_INVENTORY
 
 | 项 | 内容 |
 |---|---|
-| 候选形式 | `v2-smoke.<可用zone>`（如 `v2-smoke.jhzyfw.com`） |
+| 候选形式 | **`v2-smoke.signivra.com`**（已定稿，§4.4.3 推荐） |
 | 绑定方式 | route → `jhzy-v2-worker-production` |
 | 用途 | 仅 `/health` 与只读 smoke |
 | 生命周期 | smoke 完成后**立即删除 route** |
@@ -306,6 +356,9 @@ wrangler rollback --env production --profile jhzy
 
 要完成 zone inventory，需以下任一：
 
+> ✅ **方案 i 已采用**：用户提供了具备只读权限的 API token，inventory 已完成（§4.4）。
+> 第一轮 `BLOCKED_NO_ZONE_INVENTORY` 阻塞已解除。
+
 ### 方案 i：提供只读 API Token（推荐）
 
 设置环境变量后即可列举：
@@ -343,8 +396,9 @@ curl -sS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
 我明确授权执行 POST-R5-P8G-H1-CREATE-SMOKE-ROUTE。
 
 授权范围：
-1. 在 <ZONE_NAME> zone 下创建 hostname <CANDIDATE_HOSTNAME> →
-   jhzy-v2-worker-production 的 route。
+1. 在 signivra.com（zone id `44d09217b82f7f46bb77d3943b8244a1`）zone 下
+   创建 hostname v2-smoke.signivra.com → jhzy-v2-worker-production 的 route，
+   并创建一条 proxied DNS 记录（CNAME/A 指向该 Worker）使 hostname 可达。
 2. 创建前必须先只读确认：
    - <CANDIDATE_HOSTNAME> 无既有 A / CNAME / route 记录
    - <CANDIDATE_HOSTNAME> 不属于任何 JHZY 1.0 正在使用的 hostname
@@ -379,13 +433,13 @@ curl -sS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
 ## 12. 结论
 
 ```
-POST_R5_P8G_STATUS      = FEASIBILITY_GATED / BLOCKED
+POST_R5_P8G_STATUS      = FEASIBILITY_COMPLETE / FEASIBLE
 CLOUDFLARE_ACCOUNT      = 8770e4917f904aed5df91c883cf058af（已证明）
-AVAILABLE_ZONES         = UNKNOWN（无 token，wrangler 无 zone 命令）
-EXISTING_WORKER_ROUTES  = UNKNOWN（同上）
-CANDIDATE_HOSTNAME      = 无法确定（依赖 zone inventory）
-ROUTE_FEASIBILITY       = BLOCKED_NO_ZONE_INVENTORY
-RECOMMENDED_PLAN        = 方案 A（临时 smoke hostname）—— 条件式，待 inventory 后定稿
+AVAILABLE_ZONES         = 4（aidongcheng.com / dongcheng-tech.com / mootlsv.com / signivra.com）
+EXISTING_WORKER_ROUTES  = 0（4 zone 全部 0 route）
+CANDIDATE_HOSTNAME      = v2-smoke.signivra.com（推荐，已定稿）
+ROUTE_FEASIBILITY       = FEASIBLE
+RECOMMENDED_PLAN        = 方案 A 已定稿：v2-smoke.signivra.com（临时 smoke hostname）
 
 ROUTE_CREATED           = NO
 DNS_CHANGED             = NO
@@ -397,9 +451,9 @@ SECRETS_CHANGED         = NO
 DEPLOY_PERFORMED        = NO
 MAIN_WORKTREE_TOUCHED   = NO（dirty 583 未变，stash 0）
 
-ROOT_CAUSE = 缺少具备 Zone:Read / Workers Routes:Read 的 API token。
-             wrangler CLI 不提供 zone/route 只读列举命令；
-             `triggers deploy` 是唯一 route 写命令（未执行）。
+ROOT_CAUSE（第一轮）= 缺少具备 Zone:Read / Workers Routes:Read 的 API token。
+             第二轮已用只读 token 补齐 inventory，阻塞解除。
+             `triggers deploy` 是唯一 route 写命令（两轮均未执行）。
 ```
 
 ### 12.1 本轮的实际产出
