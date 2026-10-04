@@ -557,3 +557,21 @@ GIT_PUSH_PERFORMED = NO
 
 本段文档不得出现：真实 token、手机号、OpenID、身份证、真实姓名、session token、raw cert_no、raw pool code。
 全部命令中 token 仅为 `<D1 edit token scoped to jhzy-v2-prod>` 占位符；DB UUID / Account ID 为公开部署标识符，非 secret。
+
+### 13.9 CERT-R5B 执行与关闭状态（closed）
+
+> 由维护窗口（2026-10-05 02:00–04:00 CST）内 TTY 自跑完成，结果见审计文档
+> `audits/2026-10-03-post-cutover-assurance/33-cert-r5b-production-import-closeout.md`。
+
+```
+CERT-R5B executed and closed:
+- legacy pool import completed      (inserted=450000 / alreadyPresent=0 / conflicts=0 / batches=90)
+- Worker deployed                   (jhzy-v2-worker-production, bfff110b-…, active 100%)
+- R5B status = PASS_WITH_FINDINGS   (仅 finding: 本地 workers.dev /health curl 被网络/代理拦截，非阻断)
+- Do NOT rerun import              (导入后 PRECONDITION=NOT_READY_FOR_IMPORT 是重复导入守卫，属健康终态)
+- Future action = post-R5 monitoring / certificate issuance validation (NOT migration rerun)
+```
+
+导入后 `id_pools=450500` / `legacy_migrated=450000` / `synthetic_compat=500` / `null_provenance=0` /
+`duplicate_code_groups=0`，`certificates=413` 未变（签发窗口关闭、未 reopen、未新发证书）。
+`0045/0046` 未重应用；JHZY 1.0 live 未触碰；未 push。
